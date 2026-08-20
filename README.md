@@ -1,150 +1,240 @@
-# IT/OT Network IDS — Zeek + ClickHouse + ChromaDB + Custom Python Dashboard
+# Network IDS - Zeek + ChromaDB + Semantic SIEM Dashboard
 
-An inline-capable network intrusion detection pipeline covering both
-IT and OT/ICS protocols, with automated CVE correlation (exact +
-semantic) and a fully custom Python (Streamlit) dashboard — no
-Grafana/Kibana.
+![Zeek](https://img.shields.io/badge/Zeek-IDS-blue) ![ChromaDB](https://img.shields.io/badge/ChromaDB-VectorDB-orange) ![Python](https://img.shields.io/badge/Python-3.11-yellow) ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-red) ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED)
 
-## Architecture
+A lightweight, single-vector-store Security Information and Event Management
+(SIEM) pipeline. Zeek watches network traffic and raises behavioral +
+signature-based alerts; those alerts are semantically correlated against
+real NVD CVE data and the MITRE ATT&CK Enterprise matrix, using embeddings
+stored entirely in ChromaDB. A Streamlit dashboard presents the result as a
+console-style SIEM console.
 
-```
-        (eth0)                                    (eth1)
-Traffic In ──▶ [ Linux Bridge / PCAP replay ] ──▶ Traffic Out
-                          │
-                          ▼
-                    ┌──────────┐
-                    │   Zeek   │  IT protocols: HTTP, DNS, SSH, TLS, SMB, FTP...
-                    │  (IDS)   │  OT protocols: Modbus (built-in), DNP3 (plugin)
-                    │          │  Signature engine: custom.sig (Snort-style)
-                    └────┬─────┘
-                         │ JSON logs (conn.log, software.log, notice.log)
-                         ▼
-                    ┌──────────┐
-                    │  ingest  │  tails logs, classifies IT/OT zone,
-                    │  (py)    │  writes structured rows AND pushes
-                    └────┬─────┘  alerts/software as JSON docs
-                         │
-              ┌──────────┴───────────┐
-              ▼                      ▼
-      ┌──────────────┐      ┌────────────────┐
-      │  ClickHouse   │      │    ChromaDB     │
-      │  (structured, │      │  (JSON docs +   │
-      │  high-volume, │      │  embeddings for │
-      │  exact SQL)   │      │  semantic search)│
-      └──────┬────────┘      └────────┬────────┘
-             ▲                        ▲
-             │                        │
-      ┌──────┴────────────────────────┴──────┐
-      │            cve-matcher                │
-      │  fuzzy match (rapidfuzz) + semantic   │
-      │  match (Chroma embeddings) vs NVD CVEs│
-      └───────────────┬────────────────────────┘
-                       ▼
-              ┌──────────────────┐
-              │  Streamlit        │  custom Python dashboard:
-              │  dashboard (py)   │  KPIs, charts, tables,
-              │                   │  semantic search box
-              └──────────────────┘
+**Current stack: Zeek -> ChromaDB -> Python (fuzzy + semantic matching) -> Streamlit.**
+No other databases involved -- everything (raw alerts, reference data, and
+correlation results) lives in ChromaDB as a single, lightweight data store.
+
+---
+
+## 1. Architecture diagram
+
+```mermaid
+flowchart TD
+    A[Network Traffic] -->|pcap / live| B["zeek<br/>(detection engine)<br/>signatures + local.zeek<br/>port-scan detector, Modbus policy"]
+    B -->|conn.log, notice.log, etc.| C["ingest<br/>parses Zeek logs into ChromaDB"]
+    C --> D[(ChromaDB)]
+    D --> E["cve-matcher<br/>fuzzy + semantic CVE matching<br/>semantic MITRE matching"]
+    E --> D
+    D --> F["dashboard (Streamlit)<br/>01 Alerts | 02 CVE Matches<br/>03 MITRE ATT&CK | 04 Analytics"]
+
+    subgraph Chroma Collections
+        D
+    end
 ```
 
-## Why these tools, and where ChromaDB actually fits
+All services run as separate containers via `docker-compose.yml`,
+communicating over the compose network. **ChromaDB is the single source of
+truth** -- no relational or structured database is involved anywhere in the
+stack. Collections stored in ChromaDB: `alerts`, `software`,
+`cve_descriptions`, `mitre_attack`, `cve_matches`, `mitre_matches`,
+`connection_stats`.
 
-- **ClickHouse** is the primary store for high-volume structured
-  telemetry: `conn_log` alone can hit millions of rows on a real
-  capture (2.5M+ observed in testing) — this is exactly what a
-  columnar analytical DB is built for, and what the dashboard's
-  aggregate queries (counts, group-bys, time series) run against.
-- **ChromaDB** is used for what it's actually built for: every
-  **alert** and **software detection** (lower-volume, semantically
-  meaningful text — not raw connection tuples) is pushed as a JSON
-  document with an embedding. This powers genuine **semantic search**
-  in the dashboard — an analyst can type a free-text description
-  ("unauthorized write to a PLC register") and find conceptually
-  related alerts/CVEs even without exact keyword overlap. `conn_log`
-  is deliberately NOT pushed to ChromaDB — embedding millions of raw
-  connection tuples has no semantic value and would be far too slow;
-  this is a stated design decision, not an oversight — mention it in
-  your report/viva.
-- **Zeek** for protocol parsing + its built-in signature framework.
-- **Streamlit** for the dashboard — plain Python, no Grafana/Kibana,
-  so every chart/query is code you wrote and can explain directly.
+---
 
-## Quick start (fast path — PCAP replay, no real interfaces needed)
+## 2. Why ChromaDB (and why *semantic* correlation)
 
-1. Get a sample pcap with a mix of IT + OT traffic. Good free sources:
-   - IT: any sample pcap (e.g. from Wireshark's sample captures)
-   - OT/ICS: search for public ICS/SCADA pcap datasets (e.g. datasets
-     from `4SICS` / `S4x` conference releases, or academic ICS
-     intrusion datasets — several are freely available for research)
-2. Drop it in `./pcaps/sample.pcap`
-3. Build and run everything:
-   ```bash
-   docker compose up --build
-   ```
-4. Watch logs come in:
-   ```bash
-   docker compose logs -f ingest
-   ```
-5. Open the dashboard: http://localhost:8501 — pure Python
-   (Streamlit), no login needed.
-6. Open ClickHouse directly if you want to query manually:
-   ```bash
-   docker exec -it ids_clickhouse clickhouse-client --database ids
-   ```
+A traditional SIEM matches alerts to threat intel using exact keyword or
+regex rules. Here, everything -- CVE descriptions, MITRE ATT&CK technique
+descriptions, alert messages -- is embedded into the same vector space
+(via ChromaDB's default `all-MiniLM-L6-v2` sentence-transformer model).
+That means an alert like *"192.168.2.53: Plaintext FTP credentials
+observed"* can be matched to the MITRE technique **T1071.002 - File
+Transfer Protocols** even though the alert text and the technique
+description share almost no exact words -- the match is on *meaning*,
+not string overlap. This is the core idea of the project.
 
-## Upgrading to live inline capture (eth0 → IDS → eth1)
+---
 
-Once you have two real (or two virtual) interfaces on your VM:
+## 3. Service-by-service breakdown
 
-1. On the **host** (not inside a container):
-   ```bash
-   sudo ./zeek/setup_bridge.sh eth0 eth1
-   ```
-   This creates a Linux bridge `br-ids` joining the two interfaces so
-   traffic flows transparently between them while being visible to Zeek.
-2. In `docker-compose.yml`, uncomment `network_mode: host` under the
-   `zeek` service, and set `MODE=live`, `LIVE_IFACE=br-ids`.
-3. `docker compose up --build zeek`
+### `zeek`
+Runs Zeek against captured/replayed traffic. Two custom detection
+mechanisms sit alongside Zeek's built-in signature framework:
+- **Port-scan detector** (`ScanDetect::Possible_Port_Scan`) -- behavioral,
+  flags a host touching many distinct destination ports in a short window.
+- **Modbus write policy** -- flags unauthorized/unexpected Modbus
+  (industrial control protocol) write operations, relevant for OT/ICS
+  security scenarios.
+- Signature framework (`signatures/`) catches known-bad patterns
+  (e.g. plaintext FTP credentials, suspicious Modbus diagnostic function
+  codes).
 
-## CVE correlation
+### `ingest`
+Parses Zeek's output logs and writes structured records into ChromaDB:
+- **`alerts`** -- every flagged event, with a `severity` and IT/OT `zone` field.
+- **`software`** -- detected software/versions per host, used for CVE matching.
+- **`connection_stats`** -- a *pre-aggregated* protocol/zone breakdown of
+  every connection Zeek observed (not just alerted ones). Captures can
+  contain hundreds of thousands to millions of connection records, so
+  this is computed in plain Python (a `Counter` over `(zone, service)`
+  pairs) rather than embedding each connection individually -- the naive
+  per-row approach was tried first and was projected to take 15+ hours
+  on a full capture; the aggregated version processes the same data in
+  under a second.
 
-`cve/fetch_cve.py` pulls a filtered CVE set from the NVD public API
-(keyword-filtered to keep it fast and relevant — see the `KEYWORDS`
-list in that file, extend it to match what's actually in your pcaps).
-`cve/match_cve.py` runs continuously, fuzzy-matching Zeek's detected
-software/version strings against that dataset and writing hits to
-`ids.cve_matches`, which also raises a dashboard alert.
+### `cve-matcher` (`match_cve.py`)
+Runs two independent matching passes in a loop:
 
-This is a deliberate simplification vs a full CPE-dictionary lookup —
-worth stating explicitly in your report as a scoping decision made
-under time constraints, with "swap in a proper CPE matcher" as a
-named future improvement.
+1. **`match_software_to_cve`** -- for every detected software+version,
+   tries (a) fuzzy string matching (`rapidfuzz`, threshold 70) against a
+   keyword field on each CVE, and (b) semantic search against embedded
+   CVE descriptions (distance threshold 1.1). Both match types are kept
+   and tagged (`match_type: fuzzy` / `semantic`).
 
-## Optional extensions (if you have time — these are strong differentiators)
+2. **`match_alerts_to_mitre`** -- semantic search only, scoped to
+   high/critical severity alerts (mirrors real SOC triage -- map the
+   serious incidents to attacker techniques first). Results commit to
+   ChromaDB every 5 alerts rather than in one batch at the end, so a
+   crash mid-run only loses a few seconds of work.
 
-- **Suricata alongside Zeek** for dedicated signature-based detection
-  using the full Emerging Threats community ruleset, feeding alerts
-  into the same `ids.alerts` table (`source = 'suricata'`).
-- **ChromaDB semantic CVE search**: embed CVE descriptions, let a user
-  type a free-text description of observed behavior and semantically
-  search for matching CVEs — genuinely showcases understanding of
-  both DB types rather than using ChromaDB as a drop-in log store.
-- **DNP3 / S7comm** full parsing (the Dockerfile attempts to install
-  `zeek-dnp3` via `zkg`; verify it built correctly, some community
-  packages lag behind Zeek versions).
-- **Automated blocking**: on a high-severity alert, have a small
-  script push a firewall rule (iptables) — turns this from a passive
-  IDS into an IPS. Good "extra" to mention verbally even if you don't
-  fully implement it.
+### `chroma`
+The single data store. Collections: `alerts`, `software`,
+`cve_descriptions`, `mitre_attack` (reference data, embedded once and
+reused), `cve_matches`, `mitre_matches`, `connection_stats` (results).
 
-## Project structure
+### `dashboard` (`app.py`, Streamlit)
+Reads directly from ChromaDB and renders four tabs:
+- **[01] Alerts** -- severity-filterable table + severity split chart.
+- **[02] CVE Matches** -- matched software/CVE pairs with CVSS scores.
+- **[03] MITRE ATT&CK** -- matched alert/technique pairs with a
+  tactic-distribution chart.
+- **[04] Analytics** -- deeper-dive views: IT vs OT traffic split, full
+  protocol/service mix (from real `conn.log` data, not just alerted
+  traffic), alert trends over time, top source hosts, CVSS distribution,
+  and most common ATT&CK techniques. Kept in a separate tab so the core
+  three views stay quick to scan.
+
+---
+
+## 4. How to run it
+
+```bash
+# Bring up the data store first
+docker compose up -d chroma
+
+# Bring up the dashboard (reads existing ChromaDB data)
+docker compose up -d dashboard
+# then open http://localhost:8501
+```
+
+To regenerate correlations from scratch (e.g. after new Zeek data):
+
+```bash
+docker compose up -d zeek ingest
+# wait for ingest to finish, then:
+docker compose up -d cve-matcher
+docker compose logs -f cve-matcher
+# once "MITRE pass complete" appears and CVE matching has settled:
+docker compose stop cve-matcher
+```
+
+---
+
+## 5. Design decisions worth knowing
+
+- **MITRE correlation is scoped to high/critical alerts only** -- a
+  deliberate triage decision (mirrors real analyst workflow), not a
+  technical limitation. Configurable via `MITRE_SEVERITY_FILTER=all`.
+- **`connection_stats` is aggregated, not per-row** -- see the `ingest`
+  section above. This was a real architectural correction made after
+  discovering the per-connection-embedding approach didn't scale.
+- **PyArrow is pinned (`14.0.2`)** in `dashboard/requirements.txt` --
+  an unpinned version caused a native segfault (`libarrow.so`, exit
+  code 139) under Streamlit's dataframe rendering on certain data
+  shapes.
+
+---
+
+## 6. Project history: the ClickHouse -> ChromaDB pivot
+
+<details>
+<summary>Click to expand -- architectural history, useful context for a viva/interview but not required reading to understand the current system.</summary>
+
+An earlier version of this project used ClickHouse (a structured
+analytical database) alongside Suricata for signature-based detection.
+That design was replaced with the current ChromaDB-only, Zeek-only
+architecture for two reasons: (1) ChromaDB's vector search enables
+*semantic* CVE/MITRE correlation for free, which a relational database
+doesn't give you without bolting on a separate embedding/search layer,
+and (2) using one data technology for both raw storage and correlation
+results keeps the stack simpler to reason about and deploy. Zeek's own
+scripting layer (behavioral detectors + signature framework) replaced
+what Suricata was doing, removing a second detection engine to maintain.
+
+**If you're reading this repo's history:** any earlier reference to
+ClickHouse or Suricata reflects this discarded design, not the current
+system. The current system -- described in every section above -- uses
+Zeek + ChromaDB only.
+
+</details>
+
+---
+
+## 7. Anticipated viva / interview questions
+
+**Q: Why ChromaDB instead of a traditional relational/structured DB?**
+A: The core value is *semantic* correlation -- matching alert text to
+MITRE technique descriptions or CVE descriptions based on meaning, not
+exact keywords. A vector store gives that natively.
+
+**Q: What's the difference between the fuzzy and semantic CVE matches?**
+A: Fuzzy matching (`rapidfuzz.partial_ratio`) catches near-exact string
+overlaps -- fast, precise, brittle to phrasing. Semantic matching embeds
+both sides into the same vector space and finds nearest neighbors --
+catches conceptually related matches fuzzy matching would miss.
+
+**Q: Why do you only correlate high/critical alerts against MITRE?**
+A: Deliberate triage design mirroring real analyst workflow, not a
+technical limitation -- configurable via an environment variable.
+
+**Q: Tell me about a mistake you made and fixed in this project.**
+A: The original `connection_stats` design embedded every single Zeek
+connection record individually for semantic search -- but nobody needs
+to *search* a connection record, only count it by protocol/zone. On a
+~950K-connection capture this was projected to take 15+ hours. I
+rewrote it to aggregate counts in plain Python during ingest and push
+only the small resulting summary (a few dozen rows) to ChromaDB,
+cutting that to under a second while preserving full visibility.
+
+**Q: What would productionization need beyond this?**
+A: Multi-tenant support, an authentication layer on the dashboard,
+horizontal scaling of the embedding/matching workers, a proper
+alerting/notification layer (Slack/email/webhook on high-confidence
+matches), and likely a security-domain fine-tuned embedding model to
+improve match precision over the default general-purpose one.
+
+---
+
+## 8. File map
 
 ```
-docker-compose.yml
-zeek/               # Zeek Dockerfile, entrypoint, site config, signatures
-ingest/              # Python service: Zeek JSON logs -> ClickHouse
-cve/                 # NVD fetch + fuzzy-match CVE correlation service
-clickhouse/init.sql  # Schema: conn_log, software_log, alerts, cve_matches
-grafana/             # Auto-provisioned datasource + starter dashboard
-pcaps/               # Drop your sample captures here
+docker-compose.yml        - orchestrates all services
+zeek/
+  local.zeek               - Zeek script config, loads custom detectors
+  signatures/               - signature framework rules
+  entrypoint.sh
+  Dockerfile
+cve/
+  match_cve.py              - CVE + MITRE matching logic
+  fetch_cve.py               - pulls NVD CVE data
+  fetch_mitre.py              - pulls MITRE ATT&CK Enterprise data
+  cve_data/                    - cached reference datasets
+  entrypoint.sh
+  Dockerfile
+dashboard/
+  app.py                    - Streamlit SIEM console (4 tabs)
+  requirements.txt          - streamlit, chromadb, pandas, plotly, pyarrow (pinned)
+  Dockerfile
+ingest/
+  ingest.py                 - parses Zeek logs into ChromaDB
+  Dockerfile
 ```

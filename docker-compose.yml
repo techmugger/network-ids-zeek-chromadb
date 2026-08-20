@@ -1,0 +1,74 @@
+version: "3.8"
+
+services:
+
+  chroma:
+    image: chromadb/chroma:0.5.5
+    container_name: ids_chroma
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+
+  zeek:
+    build: ./zeek
+    container_name: ids_zeek
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    volumes:
+      - ./zeek/local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
+      - ./zeek/signatures:/usr/local/zeek/share/zeek/site/signatures:ro
+      - ./pcaps:/pcaps:ro
+      - zeek_logs:/usr/local/zeek/logs
+    environment:
+      - MODE=pcap
+      - PCAP_FILE=/pcaps/sample.pcap
+    depends_on:
+      chroma:
+        condition: service_started
+
+  ingest:
+    build: ./ingest
+    container_name: ids_ingest
+    volumes:
+      - zeek_logs:/usr/local/zeek/logs:ro
+    environment:
+      - ZEEK_LOG_DIR=/usr/local/zeek/logs
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+    depends_on:
+      chroma:
+        condition: service_started
+
+  cve-matcher:
+    build: ./cve
+    container_name: ids_cve_matcher
+    volumes:
+      - ./cve/cve_data:/cve_data
+    environment:
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+      - POLL_INTERVAL_SECONDS=30
+    depends_on:
+      chroma:
+        condition: service_started
+
+  dashboard:
+    build: ./dashboard
+    container_name: ids_dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8000
+    depends_on:
+      chroma:
+        condition: service_started
+
+volumes:
+  zeek_logs:
+  chroma_data:

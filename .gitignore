@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+.env
+zeek_logs/
+chroma_data/
+*.pcap
+cve_data/*.json
+mitre_data/*.json
+.DS_Store

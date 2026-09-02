@@ -1,18 +1,20 @@
 """
-match_cve.py - ChromaDB-only version, with MITRE ATT&CK correlation.
+match_cve.py - ClickHouse version, with MITRE ATT&CK correlation.
 
-Reads software detections and alerts back out of ChromaDB (pushed
-there by ingest.py), matches them two ways:
+Reads software detections and alerts out of ClickHouse (written by
+ingest.py), matches them two ways:
 
-1. Software -> CVE: fuzzy string match (rapidfuzz) + semantic search
-   against embedded NVD CVE descriptions.
-2. Alerts -> MITRE ATT&CK: semantic search against embedded ATT&CK
-   technique descriptions, mapping each alert to the technique(s) it
-   most closely resembles.
+1. Software -> CVE: fuzzy string match (rapidfuzz, unchanged) + semantic
+   search using ClickHouse's native cosineDistance() against embedded
+   NVD CVE descriptions.
+2. Alerts -> MITRE ATT&CK: semantic search (cosineDistance()) against
+   embedded ATT&CK technique descriptions, mapping each high/critical
+   alert to the technique it most closely resembles.
 
-Results are written back into two more ChromaDB collections:
-cve_matches and mitre_matches. No structured database involved -
-ChromaDB is the single store for the whole project.
+Results are written to the cve_matches and mitre_matches tables.
+Embeddings are computed here with sentence-transformers (same model
+as before, all-MiniLM-L6-v2) and stored as Array(Float32) columns -
+ClickHouse does the nearest-neighbor search in SQL.
 """
 
 import json
@@ -21,14 +23,18 @@ import time
 import logging
 from datetime import datetime
 
-import chromadb
+import clickhouse_connect
 from rapidfuzz import fuzz
+from sentence_transformers import SentenceTransformer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [cve-matcher] %(message)s")
 log = logging.getLogger("cve-matcher")
 
-CHROMA_HOST = os.environ.get("CHROMA_HOST", "chroma")
-CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8000"))
+CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
+CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
+CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "siem_user")
+CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "changeme")
+CLICKHOUSE_DB = os.environ.get("CLICKHOUSE_DB", "siem")
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 
 CVE_FILE = "/cve_data/cve_local.json"
@@ -37,18 +43,26 @@ MITRE_FILE = "/cve_data/mitre_local.json"
 FUZZY_THRESHOLD = 70
 SEMANTIC_DISTANCE_MAX = 1.1
 
+# Loaded once at import time - same model as the ChromaDB version used
+# internally, just called explicitly now instead of automatically.
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
-def connect_chroma(retries=15, delay=3):
+
+def connect_clickhouse(retries=15, delay=3):
     for attempt in range(retries):
         try:
-            client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-            client.heartbeat()
-            log.info("Connected to ChromaDB")
+            client = clickhouse_connect.get_client(
+                host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT,
+                username=CLICKHOUSE_USER, password=CLICKHOUSE_PASSWORD,
+                database=CLICKHOUSE_DB,
+            )
+            client.command("SELECT 1")
+            log.info("Connected to ClickHouse")
             return client
         except Exception as e:
-            log.warning(f"ChromaDB not ready ({e}), retry {attempt+1}/{retries}")
+            log.warning(f"ClickHouse not ready ({e}), retry {attempt+1}/{retries}")
             time.sleep(delay)
-    raise RuntimeError("Could not connect to ChromaDB")
+    raise RuntimeError("Could not connect to ClickHouse")
 
 
 def load_json(path):
@@ -59,168 +73,175 @@ def load_json(path):
         return json.load(f)
 
 
-def build_reference_collection(client, name, items, id_key, doc_key, meta_keys):
+def build_cve_reference(client, items):
     if not items:
-        return None
-    collection = client.get_or_create_collection(name=name)
-    deduped = {}
-    for item in items:
-        if item.get(id_key) and item.get(doc_key):
-            deduped[item[id_key]] = item
-    ids, documents, metadatas = [], [], []
-    for key, item in deduped.items():
-        ids.append(key)
-        documents.append(item[doc_key][:1000])
-        metadatas.append({k: (item.get(k) if item.get(k) is not None else "") for k in meta_keys})
-    if ids:
-        collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-        log.info(f"Embedded {len(ids)} unique entries into '{name}'")
-    return collection
-
-
-def get_all_docs(collection):
-    if collection is None:
-        return []
+        return False
+    deduped = {i["cve_id"]: i for i in items if i.get("cve_id") and i.get("description")}
+    if not deduped:
+        return False
+    texts = [i["description"][:1000] for i in deduped.values()]
+    embeddings = model.encode(texts, show_progress_bar=False).tolist()
+    rows = []
+    for (cve_id, item), emb in zip(deduped.items(), embeddings):
+        cvss = item.get("cvss_score")
+        rows.append([
+            cve_id, item["description"][:1000], emb,
+            item.get("keyword", "") or "",
+            float(cvss) if cvss is not None else 0.0,
+        ])
     try:
-        result = collection.get(include=["metadatas", "documents"])
-        return list(zip(result.get("ids", []), result.get("documents", []), result.get("metadatas", [])))
+        client.command("TRUNCATE TABLE cve_descriptions")
+        client.insert("cve_descriptions", rows,
+                       column_names=["cve_id", "description", "embedding", "keyword", "cvss_score"])
+        log.info(f"Embedded {len(rows)} unique CVE entries into 'cve_descriptions'")
+        return True
     except Exception as e:
-        log.warning(f"Could not read collection: {e}")
-        return []
+        log.warning(f"Failed to build cve_descriptions: {e}")
+        return False
 
 
-def already_seen(collection):
-    seen = set()
-    for _id, _doc, meta in get_all_docs(collection):
-        key = meta.get("source_key")
-        if key:
-            seen.add(key)
-    return seen
+def build_mitre_reference(client, items):
+    if not items:
+        return False
+    deduped = {i["technique_id"]: i for i in items if i.get("technique_id") and i.get("description")}
+    if not deduped:
+        return False
+    texts = [i["description"][:1000] for i in deduped.values()]
+    embeddings = model.encode(texts, show_progress_bar=False).tolist()
+    rows = []
+    for (tid, item), emb in zip(deduped.items(), embeddings):
+        rows.append([tid, item["description"][:1000], emb,
+                     item.get("name", "") or "", item.get("tactic", "") or ""])
+    try:
+        client.command("TRUNCATE TABLE mitre_attack")
+        client.insert("mitre_attack", rows,
+                       column_names=["technique_id", "description", "embedding", "name", "tactic"])
+        log.info(f"Embedded {len(rows)} unique MITRE technique(s) into 'mitre_attack'")
+        return True
+    except Exception as e:
+        log.warning(f"Failed to build mitre_attack: {e}")
+        return False
 
 
-def match_software_to_cve(client, software_col, cve_data, cve_collection):
-    cve_matches_col = client.get_or_create_collection(name="cve_matches")
-    seen = already_seen(cve_matches_col)
+def already_seen(client, table):
+    try:
+        result = client.query(f"SELECT DISTINCT source_key FROM {table}")
+        return {row[0] for row in result.result_rows}
+    except Exception as e:
+        log.warning(f"Could not read {table}: {e}")
+        return set()
 
-    new_ids, new_docs, new_meta = [], [], []
-    for sw_id, sw_doc, sw_meta in get_all_docs(software_col):
-        host = sw_meta.get("host", "")
-        name = sw_meta.get("name", "")
-        version = sw_meta.get("unparsed_version", "")
+
+def match_software_to_cve(client, cve_data, cve_ref_loaded):
+    seen = already_seen(client, "cve_matches")
+    software_rows = client.query("SELECT id, host, name, unparsed_version FROM software").result_rows
+
+    new_rows = []
+    for sw_id, host, name, version in software_rows:
         software_str = f"{name} {version}".strip()
         if not software_str:
             continue
 
+        # Fuzzy pass - unchanged, still runs against the in-memory CVE list.
         for cve in cve_data:
             source_key = f"{host}|{name}|{cve['cve_id']}"
             if source_key in seen:
                 continue
             score = fuzz.partial_ratio(software_str.lower(), cve.get("keyword", "").lower())
             if score >= FUZZY_THRESHOLD:
-                match_id = f"cve_{source_key}"[:60]
-                new_ids.append(match_id)
-                new_docs.append(f"{software_str} matches {cve['cve_id']}")
-                new_meta.append({
-                    "source_key": source_key, "host": host, "software": software_str,
-                    "cve_id": cve["cve_id"], "cvss_score": cve.get("cvss_score") or 0,
-                    "description": cve.get("description", "")[:500], "match_type": "fuzzy",
-                    "ts": datetime.utcnow().isoformat(),
-                })
+                new_rows.append([
+                    f"cve_{source_key}"[:60], source_key, host, software_str,
+                    cve["cve_id"], float(cve.get("cvss_score") or 0),
+                    (cve.get("description", "") or "")[:500], "fuzzy",
+                    datetime.utcnow().isoformat(),
+                ])
                 seen.add(source_key)
 
-        if cve_collection is not None:
+        # Semantic pass - was collection.query(), now cosineDistance() in SQL.
+        if cve_ref_loaded:
             try:
-                result = cve_collection.query(query_texts=[software_str], n_results=3)
-                for cve_id, dist, meta, desc in zip(
-                    result.get("ids", [[]])[0], result.get("distances", [[]])[0],
-                    result.get("metadatas", [[]])[0], result.get("documents", [[]])[0],
-                ):
+                vec = model.encode(software_str).tolist()
+                result = client.query(
+                    "SELECT cve_id, cvss_score, description, "
+                    "cosineDistance(embedding, {vec:Array(Float32)}) AS dist "
+                    "FROM cve_descriptions ORDER BY dist ASC LIMIT 3",
+                    parameters={"vec": vec},
+                )
+                for cve_id, cvss_score, description, dist in result.result_rows:
                     source_key = f"{host}|{name}|{cve_id}"
                     if source_key in seen or dist > SEMANTIC_DISTANCE_MAX:
                         continue
-                    match_id = f"cve_{source_key}"[:60]
-                    new_ids.append(match_id)
-                    new_docs.append(f"{software_str} semantically matches {cve_id}")
-                    new_meta.append({
-                        "source_key": source_key, "host": host, "software": software_str,
-                        "cve_id": cve_id, "cvss_score": meta.get("cvss_score") or 0,
-                        "description": desc[:500], "match_type": "semantic",
-                        "ts": datetime.utcnow().isoformat(),
-                    })
+                    new_rows.append([
+                        f"cve_{source_key}"[:60], source_key, host, software_str,
+                        cve_id, float(cvss_score or 0), (description or "")[:500], "semantic",
+                        datetime.utcnow().isoformat(),
+                    ])
                     seen.add(source_key)
             except Exception as e:
                 log.warning(f"Semantic CVE query failed for '{software_str}': {e}")
 
-    if new_ids:
-        cve_matches_col.upsert(ids=new_ids, documents=new_docs, metadatas=new_meta)
-        log.info(f"Inserted {len(new_ids)} new CVE match(es)")
+    if new_rows:
+        client.insert(
+            "cve_matches", new_rows,
+            column_names=["id", "source_key", "host", "software", "cve_id",
+                          "cvss_score", "description", "match_type", "ts"],
+        )
+        log.info(f"Inserted {len(new_rows)} new CVE match(es)")
 
 
-def match_alerts_to_mitre(client, alerts_col, mitre_collection):
-    if mitre_collection is None:
+def match_alerts_to_mitre(client, mitre_ref_loaded):
+    if not mitre_ref_loaded:
         return
-    mitre_matches_col = client.get_or_create_collection(name="mitre_matches")
-    seen = already_seen(mitre_matches_col)
+    seen = already_seen(client, "mitre_matches")
 
-    all_alerts = get_all_docs(alerts_col)
-    filtered = [
-        (aid, adoc, ameta) for aid, adoc, ameta in all_alerts
-        if str(ameta.get("severity", "")).lower() in {"high", "critical"}
-    ]
-    log.info(f"MITRE pass: {len(filtered)}/{len(all_alerts)} alerts match severity filter [high, critical]")
+    total_alerts = client.query("SELECT count() FROM alerts").result_rows[0][0]
+    filtered = client.query(
+        "SELECT id, note_type, message, severity FROM alerts "
+        "WHERE lower(severity) IN ('high', 'critical')"
+    ).result_rows
+    log.info(f"MITRE pass: {len(filtered)}/{total_alerts} alerts match severity filter [high, critical]")
 
-    pending_ids, pending_docs, pending_meta = [], [], []
+    pending_rows = []
     processed = 0
     inserted_total = 0
-    debug_logged = False
 
     def flush():
-        nonlocal pending_ids, pending_docs, pending_meta, inserted_total
-        if pending_ids:
-            mitre_matches_col.upsert(ids=pending_ids, documents=pending_docs, metadatas=pending_meta)
-            inserted_total += len(pending_ids)
-            log.info(f"Committed {len(pending_ids)} MITRE correlation(s) (running total: {inserted_total})")
-            pending_ids, pending_docs, pending_meta = [], [], []
+        nonlocal pending_rows, inserted_total
+        if pending_rows:
+            client.insert(
+                "mitre_matches", pending_rows,
+                column_names=["id", "source_key", "alert_note_type", "alert_message",
+                              "alert_severity", "technique_id", "technique_name",
+                              "tactic", "similarity", "ts"],
+            )
+            inserted_total += len(pending_rows)
+            log.info(f"Committed {len(pending_rows)} MITRE correlation(s) (running total: {inserted_total})")
+            pending_rows = []
 
-    for alert_id, alert_doc, alert_meta in filtered:
+    for alert_id, note_type, message, severity in filtered:
+        alert_doc = f"{note_type}: {message}"
         try:
-            result = mitre_collection.query(query_texts=[alert_doc], n_results=1)
-
-            if not debug_logged:
-                log.info(f"DEBUG raw query result for alert {alert_id}: {result}")
-                debug_logged = True
-
-            ids_list = result.get("ids", [[]])[0]
-            if not ids_list:
-                log.info(f"DEBUG: empty ids_list for alert {alert_id}")
+            vec = model.encode(alert_doc).tolist()
+            result = client.query(
+                "SELECT technique_id, name, tactic, "
+                "cosineDistance(embedding, {vec:Array(Float32)}) AS dist "
+                "FROM mitre_attack ORDER BY dist ASC LIMIT 1",
+                parameters={"vec": vec},
+            )
+            if not result.result_rows:
                 processed += 1
                 continue
-
-            tech_id = ids_list[0]
-            dist_list = result.get("distances", [[]])[0]
-            dist = dist_list[0] if dist_list else None
-            meta_list = result.get("metadatas", [[]])[0]
-            meta = meta_list[0] if meta_list else {}
-
-            source_key = f"{alert_id}|{tech_id}"
+            technique_id, tech_name, tactic, dist = result.result_rows[0]
+            source_key = f"{alert_id}|{technique_id}"
             if source_key in seen:
                 processed += 1
                 continue
 
-            match_id = f"mitre_{source_key}"[:60]
-            pending_ids.append(match_id)
-            pending_docs.append(f"{alert_doc} -> {tech_id} {meta.get('name', '')}")
-            pending_meta.append({
-                "source_key": source_key,
-                "alert_note_type": alert_meta.get("note_type", ""),
-                "alert_message": alert_meta.get("message", ""),
-                "alert_severity": alert_meta.get("severity", ""),
-                "technique_id": tech_id,
-                "technique_name": meta.get("name", ""),
-                "tactic": meta.get("tactic", ""),
-                "similarity": round(1 - min(dist, 1.0), 3) if dist is not None else 0,
-                "ts": datetime.utcnow().isoformat(),
-            })
+            pending_rows.append([
+                f"mitre_{source_key}"[:60], source_key, note_type, message, severity,
+                technique_id, tech_name, tactic, round(1 - min(dist, 1.0), 3),
+                datetime.utcnow().isoformat(),
+            ])
             seen.add(source_key)
         except Exception as e:
             log.warning(f"Semantic MITRE query failed for alert '{alert_id}': {e}")
@@ -235,19 +256,13 @@ def match_alerts_to_mitre(client, alerts_col, mitre_collection):
 
 
 def main():
-    client = connect_chroma()
-    alerts_col = client.get_or_create_collection(name="alerts")
-    software_col = client.get_or_create_collection(name="software")
+    client = connect_clickhouse()
 
     cve_data = load_json(CVE_FILE)
     mitre_data = load_json(MITRE_FILE)
 
-    cve_collection = build_reference_collection(
-        client, "cve_descriptions", cve_data, "cve_id", "description", ["keyword", "cvss_score"]
-    )
-    mitre_collection = build_reference_collection(
-        client, "mitre_attack", mitre_data, "technique_id", "description", ["name", "tactic"]
-    )
+    cve_ref_loaded = build_cve_reference(client, cve_data)
+    mitre_ref_loaded = build_mitre_reference(client, mitre_data)
 
     last_reload = time.time()
 
@@ -255,18 +270,14 @@ def main():
         if time.time() - last_reload > 900:
             cve_data = load_json(CVE_FILE)
             mitre_data = load_json(MITRE_FILE)
-            cve_collection = build_reference_collection(
-                client, "cve_descriptions", cve_data, "cve_id", "description", ["keyword", "cvss_score"]
-            )
-            mitre_collection = build_reference_collection(
-                client, "mitre_attack", mitre_data, "technique_id", "description", ["name", "tactic"]
-            )
+            cve_ref_loaded = build_cve_reference(client, cve_data)
+            mitre_ref_loaded = build_mitre_reference(client, mitre_data)
             last_reload = time.time()
 
         if cve_data:
-            match_software_to_cve(client, software_col, cve_data, cve_collection)
+            match_software_to_cve(client, cve_data, cve_ref_loaded)
         if mitre_data:
-            match_alerts_to_mitre(client, alerts_col, mitre_collection)
+            match_alerts_to_mitre(client, mitre_ref_loaded)
 
         time.sleep(POLL_INTERVAL)
 

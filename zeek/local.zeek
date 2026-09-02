@@ -1,5 +1,5 @@
 ## local.zeek - IDS project site config
-## Enables JSON-formatted logs (much easier to ingest into ClickHouse)
+## Enables JSON-formatted logs (much easier to ingest downstream)
 ## and turns on OT/ICS protocol analysis alongside the default IT set.
 
 @load base/frameworks/notice
@@ -22,8 +22,14 @@
 @load policy/protocols/ssh/software
 
 ## --- OT / ICS protocols ---
-@load base/protocols/modbus          # built-in: Modbus TCP (common in SCADA/PLC traffic)
-# @load dnp3                          # uncomment if zeek-dnp3 package installed successfully
+## ICSNPP packages (installed via zkg - see zeek/Dockerfile) provide
+## extended Modbus, DNP3, S7comm, and BACnet analyzers with dedicated
+## per-protocol logs instead of everything folding into conn.log's
+## generic "service" field. @load packages loads every zkg-installed
+## package at once, so nothing needs listing individually here - this
+## replaces the old bare `@load base/protocols/modbus` line and the
+## dead commented-out dnp3 line.
+@load packages
 
 ## --- Signature-based detection ---
 ## Point Zeek at a custom signature file (Snort-style syntax supported)

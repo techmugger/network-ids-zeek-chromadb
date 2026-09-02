@@ -2,16 +2,21 @@ version: "3.8"
 
 services:
 
-  chroma:
-    image: chromadb/chroma:0.5.5
-    container_name: ids_chroma
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: ids_clickhouse
     ports:
-      - "8000:8000"
+      - "8123:8123"
+      - "9000:9000"
     volumes:
-      - chroma_data:/chroma/chroma
+      - clickhouse_data:/var/lib/clickhouse
+      # ClickHouse's official image auto-runs any .sql file placed here
+      # on first startup - this loads your schema automatically.
+      - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     environment:
-      - IS_PERSISTENT=TRUE
-      - ANONYMIZED_TELEMETRY=FALSE
+      - CLICKHOUSE_DB=siem
+      - CLICKHOUSE_USER=siem_user
+      - CLICKHOUSE_PASSWORD=changeme
 
   zeek:
     build: ./zeek
@@ -28,7 +33,7 @@ services:
       - MODE=pcap
       - PCAP_FILE=/pcaps/sample.pcap
     depends_on:
-      chroma:
+      clickhouse:
         condition: service_started
 
   ingest:
@@ -38,10 +43,13 @@ services:
       - zeek_logs:/usr/local/zeek/logs:ro
     environment:
       - ZEEK_LOG_DIR=/usr/local/zeek/logs
-      - CHROMA_HOST=chroma
-      - CHROMA_PORT=8000
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=siem_user
+      - CLICKHOUSE_PASSWORD=changeme
+      - CLICKHOUSE_DB=siem
     depends_on:
-      chroma:
+      clickhouse:
         condition: service_started
 
   cve-matcher:
@@ -50,11 +58,14 @@ services:
     volumes:
       - ./cve/cve_data:/cve_data
     environment:
-      - CHROMA_HOST=chroma
-      - CHROMA_PORT=8000
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=siem_user
+      - CLICKHOUSE_PASSWORD=changeme
+      - CLICKHOUSE_DB=siem
       - POLL_INTERVAL_SECONDS=30
     depends_on:
-      chroma:
+      clickhouse:
         condition: service_started
 
   dashboard:
@@ -63,12 +74,15 @@ services:
     ports:
       - "8501:8501"
     environment:
-      - CHROMA_HOST=chroma
-      - CHROMA_PORT=8000
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=siem_user
+      - CLICKHOUSE_PASSWORD=changeme
+      - CLICKHOUSE_DB=siem
     depends_on:
-      chroma:
+      clickhouse:
         condition: service_started
 
 volumes:
   zeek_logs:
-  chroma_data:
+  clickhouse_data:

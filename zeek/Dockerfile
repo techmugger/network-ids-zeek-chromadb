@@ -29,12 +29,19 @@ ENV PATH="/opt/zeek/bin:/usr/local/zeek/bin:${PATH}"
 RUN ln -s /opt/zeek /usr/local/zeek || true
 
 # ---------------------------------------------------------------
-# OT/ICS protocol support: Zeek ships Modbus support built in.
-# For DNP3 / S7comm / EtherNet-IP, install community packages via
-# zkg (Zeek's package manager).
+# OT/ICS protocol support: Zeek ships a bare-bones Modbus analyzer
+# built in. CISA/INL's ICSNPP packages replace/extend it and add
+# proper DNP3, S7comm, and BACnet logging with far more granular
+# fields (dedicated modbus.log / dnp3.log / s7comm.log / bacnet.log
+# instead of everything folding into conn.log's generic "service"
+# field). Each install is best-effort, same pattern as before -
+# a network hiccup during build shouldn't break the whole image.
 # ---------------------------------------------------------------
 RUN zkg autoconfig --force || true
-RUN zkg install --force cybera/zeek-dnp3 || echo "dnp3 plugin install skipped - add manually if needed"
+RUN zkg install --force cisagov/icsnpp-modbus || echo "icsnpp-modbus install skipped - add manually if needed"
+RUN zkg install --force cisagov/icsnpp-dnp3 || echo "icsnpp-dnp3 install skipped - add manually if needed"
+RUN zkg install --force cisagov/icsnpp-s7comm || echo "icsnpp-s7comm install skipped - add manually if needed"
+RUN zkg install --force cisagov/icsnpp-bacnet || echo "icsnpp-bacnet install skipped - add manually if needed"
 
 WORKDIR /usr/local/zeek
 

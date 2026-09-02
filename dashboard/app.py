@@ -1,11 +1,10 @@
 """
 app.py - Simplified SIEM-style IDS Dashboard (Streamlit)
 
-ChromaDB-only: every query here reads JSON documents + metadata
-back out of ChromaDB collections (alerts, cve_matches, mitre_matches)
-and uses pandas for any filtering/sorting - no structured database
-involved, per project requirement to keep this lightweight and
-single-database.
+ClickHouse version: every query here reads rows back out of
+ClickHouse tables (alerts, cve_matches, mitre_matches,
+connection_stats) into pandas DataFrames for filtering/sorting -
+the ChromaDB layer has been fully replaced.
 
 Core views: Alerts (flagged by severity), CVE Matches, MITRE ATT&CK
 Correlation - kept deliberately simple/uncluttered per faculty
@@ -18,14 +17,17 @@ import os
 import time
 from datetime import datetime
 
-import chromadb
+import clickhouse_connect
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-CHROMA_HOST = os.environ.get("CHROMA_HOST", "chroma")
-CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8000"))
+CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
+CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
+CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "siem_user")
+CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "changeme")
+CLICKHOUSE_DB = os.environ.get("CLICKHOUSE_DB", "siem")
 
 st.set_page_config(page_title="IDS SIEM Dashboard", layout="wide", initial_sidebar_state="expanded")
 
@@ -97,9 +99,6 @@ def kpi_card(label, value, accent="#6E6E76"):
     )
 
 
-# Shared severity color palette used across charts, table row highlighting,
-# and the small legend chips - one place to change if the palette needs
-# tweaking later.
 SEVERITY_COLORS = {
     "critical": "#EF4444",
     "high": "#EF4444",
@@ -115,17 +114,10 @@ SEVERITY_ROW_STYLE = {
     "info": "background-color: #1A1A1D; color: #B8B8BF;",
 }
 
-# Simple keyword-based protocol tagging for the Analytics tab. This is a
-# heuristic derived from alert text (note_type + message), not a
-# dedicated protocol field in the schema - flagged here so it's clear
-# where the classification comes from if asked.
 PROTOCOL_KEYWORDS = ["Modbus", "FTP", "SSH", "SMB", "HTTP", "HTTPS", "DNS", "RDP", "Telnet", "TFTP", "SNMP"]
 
 
 def style_by_severity(df: pd.DataFrame, col: str):
-    """Return a pandas Styler that colors every row according to its
-    severity value, so high/critical rows are immediately visible in
-    red without needing to read the severity column text."""
     def _row_style(row):
         sev = str(row.get(col, "")).strip().lower()
         css = SEVERITY_ROW_STYLE.get(sev, "")
@@ -134,9 +126,6 @@ def style_by_severity(df: pd.DataFrame, col: str):
 
 
 def style_by_cvss(df: pd.DataFrame, col: str = "cvss_score"):
-    """CVE Matches has no severity field directly - bucket by CVSS score
-    instead, using the same red/amber/blue visual language so all
-    tabs read consistently at a glance."""
     def _row_style(row):
         try:
             score = float(row.get(col))
@@ -155,10 +144,6 @@ def style_by_cvss(df: pd.DataFrame, col: str = "cvss_score"):
 
 
 def themed_chart(fig, height=420, title=None):
-    """Apply the dashboard's dark theme + a larger base font to a plotly
-    figure, so charts don't render with Plotly's default light background
-    and small text against the dark dashboard. Optional title renders in
-    the same IBM Plex Mono kicker style used elsewhere in the dashboard."""
     layout_kwargs = dict(
         template="plotly_dark",
         paper_bgcolor="#0A0A0C",
@@ -181,19 +166,10 @@ def themed_chart(fig, height=420, title=None):
 
 
 def parse_ts_series(series: pd.Series) -> pd.Series:
-    """Alerts store 'ts' as raw Zeek epoch-seconds values from a replayed
-    pcap capture, so the resulting dates land in the past relative to
-    today - that's expected given this is historical sample traffic, not
-    a live feed. Converts to real datetimes so alert volume can be
-    charted over time."""
     return pd.to_datetime(pd.to_numeric(series, errors="coerce"), unit="s", errors="coerce")
 
 
 def extract_protocol(note_type: str, message: str) -> str:
-    """Heuristic protocol tag for a single alert, based on keyword
-    matches in its note_type/message text. Falls back to 'Port Scan'
-    for scan-detector alerts (no specific protocol involved) and
-    'Other' when nothing matches."""
     text = f"{note_type} {message}".lower()
     for kw in PROTOCOL_KEYWORDS:
         if kw.lower() in text:
@@ -215,35 +191,30 @@ def severity_legend():
 def get_client():
     for attempt in range(10):
         try:
-            client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-            client.heartbeat()
+            client = clickhouse_connect.get_client(
+                host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT,
+                username=CLICKHOUSE_USER, password=CLICKHOUSE_PASSWORD,
+                database=CLICKHOUSE_DB,
+            )
+            client.command("SELECT 1")
             return client
         except Exception:
             time.sleep(2)
     return None
 
 
-def collection_to_df(client, name: str, extra_cols=None) -> pd.DataFrame:
-    """Fetch every document in a Chroma collection and flatten its
-    metadata into a pandas DataFrame - this is how every view in
-    this dashboard gets its data, since there's no SQL to query."""
-    if client is None:
+@st.cache_data(ttl=10)
+def table_to_df(_client, query: str) -> pd.DataFrame:
+    if _client is None:
         return pd.DataFrame()
     try:
-        collection = client.get_or_create_collection(name=name)
-        result = collection.get(include=["metadatas", "documents"])
-        rows = []
-        for _id, doc, meta in zip(result.get("ids", []), result.get("documents", []), result.get("metadatas", [])):
-            row = dict(meta)
-            row["document"] = doc
-            rows.append(row)
-        return pd.DataFrame(rows)
+        return _client.query_df(query)
     except Exception:
         return pd.DataFrame()
 
 
 st.sidebar.title("IDS SIEM Dashboard")
-st.sidebar.caption("Zeek + ChromaDB + Python (Streamlit)")
+st.sidebar.caption("Zeek + ClickHouse + Python (Streamlit)")
 auto_refresh = st.sidebar.toggle("Auto-refresh every 15s", value=True)
 if auto_refresh:
     st_autorefresh(interval=15_000, key="autorefresh")
@@ -253,16 +224,17 @@ st.sidebar.caption(f"Last refreshed: {datetime.now().strftime('%H:%M:%S')}")
 
 client = get_client()
 if client is None:
-    st.error("ChromaDB is not reachable. Check that the 'chroma' service is running.")
+    st.error("ClickHouse is not reachable. Check that the 'clickhouse' service is running.")
     st.stop()
 
-alerts_df = collection_to_df(client, "alerts")
-cve_df = collection_to_df(client, "cve_matches")
-mitre_df = collection_to_df(client, "mitre_matches")
-conn_df = collection_to_df(client, "connections")
+alerts_df = table_to_df(client, "SELECT ts, note_type, message, src_h, dst_h, severity, zone FROM alerts")
+cve_df = table_to_df(client, "SELECT ts, host, software, cve_id, cvss_score, match_type, description FROM cve_matches")
+mitre_df = table_to_df(client, "SELECT ts, alert_note_type, alert_message, alert_severity, technique_id, "
+                                "technique_name, tactic, similarity FROM mitre_matches")
+conn_stats_df = table_to_df(client, "SELECT zone, service, count FROM connection_stats")
+if not conn_stats_df.empty and "count" in conn_stats_df.columns:
+    conn_stats_df["count"] = pd.to_numeric(conn_stats_df["count"], errors="coerce").fillna(0).astype(int)
 
-# Precompute derived fields once, up front, so both the Alerts tab and
-# the Analytics tab can reuse them without recalculating.
 if not alerts_df.empty:
     alerts_df["_dt"] = parse_ts_series(alerts_df["ts"]) if "ts" in alerts_df.columns else pd.NaT
     if "note_type" in alerts_df.columns and "message" in alerts_df.columns:
@@ -306,7 +278,7 @@ st.markdown("""
     <div class="brand-mark">IDS</div>
     <div>
       <div class="brand-title">SIEM Console</div>
-      <div class="brand-sub">ZEEK &nbsp;/&nbsp; CHROMADB &nbsp;/&nbsp; CVE &nbsp;/&nbsp; MITRE ATT&amp;CK</div>
+      <div class="brand-sub">ZEEK &nbsp;/&nbsp; CLICKHOUSE &nbsp;/&nbsp; CVE &nbsp;/&nbsp; MITRE ATT&amp;CK</div>
     </div>
   </div>
   <div class="masthead-right">
@@ -334,11 +306,6 @@ tab_alerts, tab_cve, tab_mitre, tab_analytics = st.tabs(
     ["[01] ALERTS", "[02] CVE MATCHES", "[03] MITRE ATT&CK", "[04] ANALYTICS"]
 )
 
-# ---------------------------------------------------------------------
-# [01] ALERTS - kept deliberately simple: one summary chart + the
-# filterable, severity-colored table. Deeper trend/host breakdowns live
-# in the Analytics tab so this view stays quick to scan.
-# ---------------------------------------------------------------------
 with tab_alerts:
     if alerts_df.empty:
         st.info("No alerts yet.")
@@ -376,13 +343,10 @@ with tab_alerts:
                 },
             )
 
-# ---------------------------------------------------------------------
-# [02] CVE MATCHES - back to table-only, no chart clutter.
-# ---------------------------------------------------------------------
 with tab_cve:
     if cve_df.empty:
         st.info(
-            "No CVE matches yet. This needs entries in the 'software' collection "
+            "No CVE matches yet. This needs entries in the 'software' table "
             "(populated from Zeek's software.log) for the matcher to correlate."
         )
     else:
@@ -414,14 +378,11 @@ with tab_cve:
             },
         )
 
-# ---------------------------------------------------------------------
-# [03] MITRE ATT&CK - back to the original single chart + table layout.
-# ---------------------------------------------------------------------
 with tab_mitre:
     if mitre_df.empty:
         st.info(
             "No MITRE ATT&CK correlations yet. This needs alerts in the 'alerts' "
-            "collection for the matcher to correlate against ATT&CK techniques."
+            "table for the matcher to correlate against ATT&CK techniques."
         )
     else:
         tactic_counts = mitre_df["tactic"].value_counts().reset_index()
@@ -456,12 +417,6 @@ with tab_mitre:
                 },
             )
 
-# ---------------------------------------------------------------------
-# [04] ANALYTICS - opt-in deeper-dive charts: IT/OT zone split,
-# protocol mix, alert trend over time, top hosts, CVSS distribution,
-# most-matched software, and most common MITRE techniques. Kept out of
-# the core three tabs so those stay quick to scan.
-# ---------------------------------------------------------------------
 with tab_analytics:
     st.markdown(
         '<div class="analytics-hint">DEEPER-DIVE VIEWS &mdash; IT/OT SPLIT, PROTOCOL MIX, TRENDS &amp; TOP ENTITIES</div>',
@@ -471,24 +426,21 @@ with tab_analytics:
     if alerts_df.empty and cve_df.empty and mitre_df.empty:
         st.info("No data yet to analyze.")
     else:
-        # --- IT/OT zone + protocol mix ---
-        # Prefer real traffic data from conn.log (every connection Zeek
-        # saw, tagged with its detected service/protocol) over the
-        # alert-text heuristic, since that's the actual full picture -
-        # not just protocols that happened to trigger an alert.
-        has_conn_data = not conn_df.empty and "service" in conn_df.columns
+        has_conn_data = not conn_stats_df.empty and {"zone", "service", "count"}.issubset(conn_stats_df.columns)
         if has_conn_data or (not alerts_df.empty and "zone" in alerts_df.columns):
             st.markdown("##### Network Zone & Protocol Mix")
-            source_label = "full traffic (conn.log)" if has_conn_data else "alert text (fallback)"
+            source_label = "full traffic (conn.log, aggregated)" if has_conn_data else "alert text (fallback)"
             st.caption(f"Source: {source_label}")
+            if has_conn_data:
+                st.caption(f"{int(conn_stats_df['count'].sum()):,} total connections analyzed")
 
             zc1, zc2 = st.columns(2)
             with zc1:
                 if has_conn_data:
-                    zone_counts = conn_df["zone"].dropna().value_counts().reset_index()
+                    zone_counts = conn_stats_df.groupby("zone")["count"].sum().reset_index()
                 else:
                     zone_counts = alerts_df["zone"].dropna().value_counts().reset_index()
-                zone_counts.columns = ["zone", "count"]
+                    zone_counts.columns = ["zone", "count"]
                 if not zone_counts.empty:
                     fig = px.pie(zone_counts, names="zone", values="count", hole=0.55,
                                  color_discrete_sequence=["#22D3EE", "#F59E0B", "#A78BFA", "#34D399"])
@@ -498,8 +450,9 @@ with tab_analytics:
                     st.info("No zone data available.")
             with zc2:
                 if has_conn_data:
-                    proto_counts = conn_df["service"].value_counts().reset_index()
+                    proto_counts = conn_stats_df.groupby("service")["count"].sum().reset_index()
                     proto_counts.columns = ["protocol", "count"]
+                    proto_counts = proto_counts.sort_values("count", ascending=False)
                 elif "_protocol" in alerts_df.columns:
                     proto_counts = alerts_df["_protocol"].value_counts().reset_index()
                     proto_counts.columns = ["protocol", "count"]
@@ -517,13 +470,8 @@ with tab_analytics:
                             "Run the ingest service to populate full traffic data from conn.log."
                         )
 
-            # Protocol usage broken down by IT vs OT zone, side by side -
-            # covers every protocol/service Zeek detected in the capture.
             if has_conn_data:
-                zone_proto = (
-                    conn_df.groupby(["service", "zone"]).size().reset_index(name="count")
-                    if "zone" in conn_df.columns else pd.DataFrame()
-                )
+                zone_proto = conn_stats_df.groupby(["service", "zone"])["count"].sum().reset_index()
                 if not zone_proto.empty:
                     fig3 = px.bar(
                         zone_proto, x="count", y="service", color="zone", orientation="h",
@@ -539,7 +487,6 @@ with tab_analytics:
                     )
             st.divider()
 
-        # --- Alert trend + top source hosts ---
         if not alerts_df.empty:
             st.markdown("##### Alert Volume & Top Sources")
             has_trend = "_dt" in alerts_df.columns and alerts_df["_dt"].notna().any()
@@ -565,7 +512,6 @@ with tab_analytics:
                     st.plotly_chart(themed_chart(fig4, height=300, title="Top Source Hosts"), use_container_width=True)
             st.divider()
 
-        # --- CVE-side analytics ---
         if not cve_df.empty:
             st.markdown("##### Vulnerability Landscape")
             cc1, cc2 = st.columns(2)
@@ -584,7 +530,6 @@ with tab_analytics:
                     st.plotly_chart(themed_chart(fig6, height=300, title="Most-Matched Software"), use_container_width=True)
             st.divider()
 
-        # --- MITRE-side analytics ---
         if not mitre_df.empty and "technique_name" in mitre_df.columns:
             st.markdown("##### Most Common ATT&CK Techniques")
             top_tech = mitre_df["technique_name"].value_counts().head(10).reset_index()

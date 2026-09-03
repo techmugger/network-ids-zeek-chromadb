@@ -35,6 +35,7 @@ CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
 CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "siem_user")
 CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "changeme")
 CLICKHOUSE_DB = os.environ.get("CLICKHOUSE_DB", "siem")
+CLICKHOUSE_SECURE = os.environ.get("CLICKHOUSE_SECURE", "false").lower() == "true"
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL_SECONDS", "30"))
 
 CVE_FILE = "/cve_data/cve_local.json"
@@ -54,7 +55,7 @@ def connect_clickhouse(retries=15, delay=3):
             client = clickhouse_connect.get_client(
                 host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT,
                 username=CLICKHOUSE_USER, password=CLICKHOUSE_PASSWORD,
-                database=CLICKHOUSE_DB,
+                database=CLICKHOUSE_DB, secure=CLICKHOUSE_SECURE,
             )
             client.command("SELECT 1")
             log.info("Connected to ClickHouse")

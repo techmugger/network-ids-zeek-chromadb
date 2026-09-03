@@ -1,7 +1,4 @@
-version: "3.8"
-
 services:
-
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     container_name: ids_clickhouse
@@ -17,7 +14,6 @@ services:
       - CLICKHOUSE_DB=siem
       - CLICKHOUSE_USER=siem_user
       - CLICKHOUSE_PASSWORD=changeme
-
   zeek:
     build: ./zeek
     container_name: ids_zeek
@@ -32,10 +28,6 @@ services:
     environment:
       - MODE=pcap
       - PCAP_FILE=/pcaps/sample.pcap
-    depends_on:
-      clickhouse:
-        condition: service_started
-
   ingest:
     build: ./ingest
     container_name: ids_ingest
@@ -43,45 +35,37 @@ services:
       - zeek_logs:/usr/local/zeek/logs:ro
     environment:
       - ZEEK_LOG_DIR=/usr/local/zeek/logs
-      - CLICKHOUSE_HOST=clickhouse
-      - CLICKHOUSE_PORT=8123
-      - CLICKHOUSE_USER=siem_user
-      - CLICKHOUSE_PASSWORD=changeme
+      - CLICKHOUSE_HOST=kko2zewbsi.germanywestcentral.azure.clickhouse.cloud
+      - CLICKHOUSE_PORT=8443
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=9Dq_66AAl9MVG
       - CLICKHOUSE_DB=siem
-    depends_on:
-      clickhouse:
-        condition: service_started
-
+      - CLICKHOUSE_SECURE=true
   cve-matcher:
     build: ./cve
     container_name: ids_cve_matcher
     volumes:
       - ./cve/cve_data:/cve_data
     environment:
-      - CLICKHOUSE_HOST=clickhouse
-      - CLICKHOUSE_PORT=8123
-      - CLICKHOUSE_USER=siem_user
-      - CLICKHOUSE_PASSWORD=changeme
+      - CLICKHOUSE_HOST=kko2zewbsi.germanywestcentral.azure.clickhouse.cloud
+      - CLICKHOUSE_PORT=8443
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=9Dq_66AAl9MVG
       - CLICKHOUSE_DB=siem
+      - CLICKHOUSE_SECURE=true
       - POLL_INTERVAL_SECONDS=30
-    depends_on:
-      clickhouse:
-        condition: service_started
-
   dashboard:
     build: ./dashboard
     container_name: ids_dashboard
     ports:
       - "8501:8501"
     environment:
-      - CLICKHOUSE_HOST=clickhouse
-      - CLICKHOUSE_PORT=8123
-      - CLICKHOUSE_USER=siem_user
-      - CLICKHOUSE_PASSWORD=changeme
+      - CLICKHOUSE_HOST=kko2zewbsi.germanywestcentral.azure.clickhouse.cloud
+      - CLICKHOUSE_PORT=8443
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=9Dq_66AAl9MVG
       - CLICKHOUSE_DB=siem
-    depends_on:
-      clickhouse:
-        condition: service_started
+      - CLICKHOUSE_SECURE=true
 
 volumes:
   zeek_logs:

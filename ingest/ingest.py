@@ -14,6 +14,12 @@ This is what the dashboard's IT/OT and protocol mix charts read from.
 CHANGED FROM THE CHROMADB VERSION: every known Zeek/ICSNPP OT service
 name is now listed explicitly in OT_SERVICES, so nothing silently
 falls through unclassified the way it was before the migration.
+
+CHANGED AGAIN (OT-undercount fix): Zeek sometimes writes a
+comma-joined service string when multiple analyzers match one
+connection (e.g. "ssl,modbus"), and DNP3's actual field value is
+"dnp3_tcp" not "dnp3". classify_zone() now splits on commas and
+checks each token, and dnp3_tcp is listed alongside dnp3.
 """
 
 import glob
@@ -35,10 +41,13 @@ CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
 CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "siem_user")
 CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "changeme")
 CLICKHOUSE_DB = os.environ.get("CLICKHOUSE_DB", "siem")
+CLICKHOUSE_SECURE = os.environ.get("CLICKHOUSE_SECURE", "false").lower() == "true"
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "3"))
 
 # Every OT service Zeek or an ICSNPP analyzer can label a connection
 # with - explicit so nothing silently falls out of the IT/OT split.
+# dnp3_tcp is Zeek's actual field value (not "dnp3") - keeping both
+# here in case a future Zeek/ICSNPP version changes the label again.
 OT_SERVICES = {
     "modbus", "dnp3", "dnp3_tcp", "s7comm", "s7comm-plus", "ethernet-ip", "cip",
     "bacnet", "bsap", "ethercat", "ge-srtp", "genisys", "opcua-binary",
@@ -50,11 +59,13 @@ OT_PORTS = {502, 20000, 102, 44818, 47808}
 def classify_zone(service: str, port: int) -> str:
     """Zeek sometimes writes a comma-joined service string when more
     than one analyzer matches a connection (e.g. "ssl,modbus") -
-    split on commas and check each token."""
+    split on commas and check each token, so a connection carrying
+    OT traffic alongside something else still gets tagged OT."""
     service_tokens = {t.strip().lower() for t in (service or "").split(",") if t.strip()}
     if service_tokens & OT_SERVICES or port in OT_PORTS:
         return "OT"
     return "IT"
+
 
 def connect_clickhouse(retries=15, delay=3):
     for attempt in range(retries):
@@ -62,7 +73,7 @@ def connect_clickhouse(retries=15, delay=3):
             client = clickhouse_connect.get_client(
                 host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT,
                 username=CLICKHOUSE_USER, password=CLICKHOUSE_PASSWORD,
-                database=CLICKHOUSE_DB,
+                database=CLICKHOUSE_DB, secure=CLICKHOUSE_SECURE,
             )
             client.command("SELECT 1")
             log.info("Connected to ClickHouse")

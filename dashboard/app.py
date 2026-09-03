@@ -23,11 +23,25 @@ import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
-CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
-CLICKHOUSE_USER = os.environ.get("CLICKHOUSE_USER", "siem_user")
-CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "changeme")
-CLICKHOUSE_DB = os.environ.get("CLICKHOUSE_DB", "siem")
+def _config(key: str, default: str) -> str:
+    """Streamlit Cloud uses st.secrets (no plain env vars available);
+    local Docker uses environment variables. Check secrets first,
+    fall back to env var, then to the default - so the same code
+    works in both places without changes."""
+    try:
+        if "clickhouse" in st.secrets and key in st.secrets["clickhouse"]:
+            return str(st.secrets["clickhouse"][key])
+    except Exception:
+        pass
+    return os.environ.get(f"CLICKHOUSE_{key.upper()}", default)
+
+
+CLICKHOUSE_HOST = _config("host", "clickhouse")
+CLICKHOUSE_PORT = int(_config("port", "8123"))
+CLICKHOUSE_USER = _config("user", "siem_user")
+CLICKHOUSE_PASSWORD = _config("password", "changeme")
+CLICKHOUSE_DB = _config("database", "siem")
+CLICKHOUSE_SECURE = _config("secure", "false").lower() == "true"
 
 st.set_page_config(page_title="IDS SIEM Dashboard", layout="wide", initial_sidebar_state="expanded")
 
@@ -194,7 +208,7 @@ def get_client():
             client = clickhouse_connect.get_client(
                 host=CLICKHOUSE_HOST, port=CLICKHOUSE_PORT,
                 username=CLICKHOUSE_USER, password=CLICKHOUSE_PASSWORD,
-                database=CLICKHOUSE_DB,
+                database=CLICKHOUSE_DB, secure=CLICKHOUSE_SECURE,
             )
             client.command("SELECT 1")
             return client

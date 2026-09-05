@@ -74,3 +74,21 @@ CREATE TABLE IF NOT EXISTS siem.mitre_matches (
     ts String
 ) ENGINE = MergeTree()
 ORDER BY (source_key, id);
+
+-- Response/enforcement layer (added for the analyst action workflow).
+-- Append-only: every Allow/Block/Investigate click is a new row, never
+-- an update. An alert's CURRENT status is the most recent row for its
+-- alert_id, computed at query time with argMax() - this keeps a full
+-- audit trail rather than overwriting history, which matters for a
+-- product-grade SIEM (who decided what, and when).
+CREATE TABLE IF NOT EXISTS siem.alert_actions (
+    id String,
+    alert_id String,
+    action String,               -- 'allow' | 'block' | 'investigate'
+    actor String,
+    notes String,
+    enforcement_status String,   -- 'stubbed' | 'applied' | 'failed' | 'not_applicable'
+    enforcement_detail String,
+    ts Float64
+) ENGINE = MergeTree()
+ORDER BY (alert_id, ts);

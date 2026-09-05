@@ -13,6 +13,7 @@ guidance. A fourth "Analytics" tab holds deeper-dive charts
 to explore further, without cluttering the core three views.
 """
 
+import hashlib
 import os
 import time
 from datetime import datetime
@@ -22,6 +23,11 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+
+import enforcement
+
+st.set_page_config(page_title="IDS SIEM Dashboard", layout="wide", initial_sidebar_state="expanded")
+
 
 def _config(key: str, default: str) -> str:
     """Streamlit Cloud uses st.secrets (no plain env vars available);
@@ -42,8 +48,6 @@ CLICKHOUSE_USER = _config("user", "siem_user")
 CLICKHOUSE_PASSWORD = _config("password", "changeme")
 CLICKHOUSE_DB = _config("database", "siem")
 CLICKHOUSE_SECURE = _config("secure", "false").lower() == "true"
-
-st.set_page_config(page_title="IDS SIEM Dashboard", layout="wide", initial_sidebar_state="expanded")
 
 st.markdown("""
 <style>
@@ -98,6 +102,34 @@ h1 { font-weight: 700 !important; letter-spacing: -0.01em; color: #ECECEE; margi
 .analytics-hint {
     font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #6E6E76;
     margin: -4px 0 16px 0; letter-spacing: 0.02em;
+}
+
+/* Alert cards - the bordered containers st.container(border=True) produces */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 10px !important;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+[data-testid="stVerticalBlockBorderWrapper"]:hover {
+    border-color: #3A3A40 !important;
+    box-shadow: 0 2px 14px rgba(0,0,0,0.35);
+}
+.stButton > button {
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    font-size: 13px !important;
+    letter-spacing: 0.01em;
+    transition: transform 0.1s ease, filter 0.15s ease;
+}
+.stButton > button:hover {
+    filter: brightness(1.12);
+    transform: translateY(-1px);
+}
+.alert-accent {
+    height: 3px; width: 100%; border-radius: 2px; margin: -4px 0 12px 0;
+}
+.alert-ts {
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: #6E6E76;
+    letter-spacing: 0.02em;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -227,6 +259,28 @@ def table_to_df(_client, query: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def record_action(_client, alert_id: str, src_h: str, dst_h: str, action: str, actor: str, notes: str):
+    """Writes one row to alert_actions (never overwrites - this is an
+    audit log), calling the pluggable enforcement hook for block/allow
+    so the recorded enforcement_status reflects what actually happened
+    (or, today, what WOULD happen once a real backend exists)."""
+    if action == "block":
+        result = enforcement.apply_block(src_h, dst_h)
+    elif action == "allow":
+        result = enforcement.apply_allow(src_h, dst_h)
+    else:
+        result = enforcement.EnforcementResult(status="not_applicable", detail="Marked for investigation.")
+
+    row_id = hashlib.sha256(f"{alert_id}|{action}|{time.time()}".encode()).hexdigest()[:24]
+    _client.insert(
+        "alert_actions",
+        [[row_id, alert_id, action, actor, notes, result.status, result.detail, time.time()]],
+        column_names=["id", "alert_id", "action", "actor", "notes",
+                      "enforcement_status", "enforcement_detail", "ts"],
+    )
+    return result
+
+
 st.sidebar.title("IDS SIEM Dashboard")
 st.sidebar.caption("Zeek + ClickHouse + Python (Streamlit)")
 auto_refresh = st.sidebar.toggle("Auto-refresh every 15s", value=True)
@@ -241,7 +295,7 @@ if client is None:
     st.error("ClickHouse is not reachable. Check that the 'clickhouse' service is running.")
     st.stop()
 
-alerts_df = table_to_df(client, "SELECT ts, note_type, message, src_h, dst_h, severity, zone FROM alerts")
+alerts_df = table_to_df(client, "SELECT id, ts, note_type, message, src_h, dst_h, severity, zone FROM alerts")
 cve_df = table_to_df(client, "SELECT ts, host, software, cve_id, cvss_score, match_type, description FROM cve_matches")
 mitre_df = table_to_df(client, "SELECT ts, alert_note_type, alert_message, alert_severity, technique_id, "
                                 "technique_name, tactic, similarity FROM mitre_matches")
@@ -249,12 +303,36 @@ conn_stats_df = table_to_df(client, "SELECT zone, service, count FROM connection
 if not conn_stats_df.empty and "count" in conn_stats_df.columns:
     conn_stats_df["count"] = pd.to_numeric(conn_stats_df["count"], errors="coerce").fillna(0).astype(int)
 
+# Latest analyst decision per alert - alert_actions is append-only (a full
+# audit trail), so "current status" is whichever row has the newest ts.
+status_df = table_to_df(
+    client,
+    "SELECT alert_id, argMax(action, ts) AS action, argMax(actor, ts) AS actor, "
+    "argMax(notes, ts) AS notes, argMax(enforcement_status, ts) AS enforcement_status, "
+    "max(ts) AS last_action_ts FROM alert_actions GROUP BY alert_id",
+)
+
 if not alerts_df.empty:
     alerts_df["_dt"] = parse_ts_series(alerts_df["ts"]) if "ts" in alerts_df.columns else pd.NaT
     if "note_type" in alerts_df.columns and "message" in alerts_df.columns:
         alerts_df["_protocol"] = alerts_df.apply(
             lambda r: extract_protocol(r.get("note_type", ""), r.get("message", "")), axis=1
         )
+    if not status_df.empty and "id" in alerts_df.columns:
+        alerts_df = alerts_df.merge(
+            status_df[["alert_id", "action", "actor", "notes", "enforcement_status"]],
+            left_on="id", right_on="alert_id", how="left",
+        )
+        for c in ["action", "actor", "notes", "enforcement_status"]:
+            alerts_df[c] = alerts_df[c].fillna("").astype(str)
+    else:
+        alerts_df["action"] = ""
+        alerts_df["actor"] = ""
+        alerts_df["notes"] = ""
+        alerts_df["enforcement_status"] = ""
+    alerts_df["status"] = alerts_df["action"].replace("", "open").map(
+        {"open": "Open", "allow": "Allowed", "block": "Blocked", "investigate": "Investigating"}
+    ).fillna("Open")
 
 st.markdown("""
 <style>
@@ -320,10 +398,85 @@ tab_alerts, tab_cve, tab_mitre, tab_analytics = st.tabs(
     ["[01] ALERTS", "[02] CVE MATCHES", "[03] MITRE ATT&CK", "[04] ANALYTICS"]
 )
 
+STATUS_BADGE_COLORS = {
+    "Open": "#8A8A93",
+    "Allowed": "#34D399",
+    "Blocked": "#EF4444",
+    "Investigating": "#F59E0B",
+}
+
+
+def badge(text: str, color: str) -> str:
+    return (
+        f'<span style="background:{color}22; color:{color}; border:1px solid {color}66; '
+        f'padding:2px 10px; border-radius:999px; font-family:\'IBM Plex Mono\',monospace; '
+        f'font-size:11px; font-weight:600; letter-spacing:0.03em;">{text}</span>'
+    )
+
+
+def human_time_ago(ts: float) -> str:
+    try:
+        delta = max(0, time.time() - float(ts))
+    except (TypeError, ValueError):
+        return "-"
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
+ACTION_ICONS = {"allow": "\u2705", "block": "\u26d4", "investigate": "\U0001F50D"}
+
 with tab_alerts:
     if alerts_df.empty:
         st.info("No alerts yet.")
     else:
+        # Persistent action feedback - stays visible until the next action or
+        # manual dismissal, instead of a toast that vanishes in a couple seconds.
+        feedback = st.session_state.get("action_feedback")
+        if feedback:
+            fb_col, dismiss_col = st.columns([10, 1])
+            with fb_col:
+                if feedback["type"] == "warning":
+                    st.warning(feedback["text"])
+                elif feedback["type"] == "success":
+                    st.success(feedback["text"])
+                else:
+                    st.info(feedback["text"])
+            with dismiss_col:
+                if st.button("\u2715", key="dismiss_feedback"):
+                    st.session_state.action_feedback = None
+                    st.rerun()
+
+        # Recent Actions - a real, live audit-trail feed straight from
+        # alert_actions, not just a badge on one card. Shows the last 10
+        # analyst decisions across ALL alerts, most recent first.
+        recent_actions_df = table_to_df(
+            client,
+            "SELECT alert_id, action, actor, notes, enforcement_status, ts "
+            "FROM alert_actions ORDER BY ts DESC LIMIT 10",
+        )
+        with st.expander(f"\U0001F4CB Recent Actions ({len(recent_actions_df)})", expanded=bool(len(recent_actions_df))):
+            if recent_actions_df.empty:
+                st.caption("No analyst actions recorded yet - use the buttons below on any alert.")
+            else:
+                lookup = alerts_df.set_index("id")["message"].to_dict() if "id" in alerts_df.columns else {}
+                for _, a in recent_actions_df.iterrows():
+                    icon = ACTION_ICONS.get(a["action"], "\u2022")
+                    msg = lookup.get(a["alert_id"], "(alert not found)")
+                    st.markdown(
+                        f"{icon} **{a['actor']}** marked an alert as **{a['action'].capitalize()}** "
+                        f"&nbsp;<span class='alert-ts'>{human_time_ago(a['ts'])}</span><br>"
+                        f"<span style='color:#8A8A93; font-size:13px;'>{str(msg)[:110]}</span>"
+                        + (f"<br><span style='color:#6E6E76; font-size:12px;'>Note: {a['notes']}</span>" if a.get("notes") else ""),
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown("<hr style='margin:8px 0; border-color:#232327;'>", unsafe_allow_html=True)
+
+        st.write("")
         sev_counts = alerts_df["severity"].value_counts().reset_index()
         sev_counts.columns = ["severity", "count"]
 
@@ -333,29 +486,135 @@ with tab_alerts:
                          color="severity", color_discrete_map=SEVERITY_COLORS)
             fig.update_traces(textinfo="percent", textfont_size=12)
             st.plotly_chart(themed_chart(fig, height=340, title="Severity Split"), use_container_width=True)
+
         with col2:
-            severities = sorted(alerts_df["severity"].dropna().unique().tolist())
-            selected_sev = st.multiselect("Filter by severity", severities, default=severities)
-            severity_legend()
-            filtered = alerts_df[alerts_df["severity"].isin(selected_sev)]
-            display_cols = [c for c in ["ts", "note_type", "message", "src_h", "dst_h", "severity", "zone"]
-                             if c in filtered.columns]
-            table = filtered[display_cols].sort_values("ts", ascending=False)
-            st.dataframe(
-                style_by_severity(table, "severity") if "severity" in table.columns else table,
-                use_container_width=True,
-                height=480,
-                hide_index=True,
-                column_config={
-                    "ts": st.column_config.TextColumn("Timestamp", width=110),
-                    "note_type": st.column_config.TextColumn("Type", width=160),
-                    "message": st.column_config.TextColumn("Message", width=650),
-                    "src_h": st.column_config.TextColumn("Source", width=110),
-                    "dst_h": st.column_config.TextColumn("Destination", width=110),
-                    "severity": st.column_config.TextColumn("Severity", width=90),
-                    "zone": st.column_config.TextColumn("Zone", width=90),
-                },
+            fc1, fc2, fc3, fc4 = st.columns([2, 2, 2, 1])
+            with fc1:
+                severities = sorted(alerts_df["severity"].dropna().unique().tolist())
+                selected_sev = st.multiselect("Severity", severities, default=severities, key="sev_filter")
+            with fc2:
+                statuses = ["Open", "Allowed", "Blocked", "Investigating"]
+                selected_status = st.multiselect("Status", statuses, default=statuses, key="status_filter")
+            with fc3:
+                search = st.text_input("Search message / host", key="alert_search")
+            with fc4:
+                page_size = st.selectbox("Per page", [10, 15, 25, 50], index=1, key="page_size_select")
+            actor = st.text_input("Analyst name (applied to actions below)", value="analyst", key="actor_input")
+
+        filtered = alerts_df[
+            alerts_df["severity"].isin(selected_sev) & alerts_df["status"].isin(selected_status)
+        ]
+        if search:
+            s = search.lower()
+            filtered = filtered[
+                filtered["message"].str.lower().str.contains(s, na=False)
+                | filtered["note_type"].str.lower().str.contains(s, na=False)
+                | filtered["src_h"].str.lower().str.contains(s, na=False)
+                | filtered["dst_h"].str.lower().str.contains(s, na=False)
+            ]
+        filtered = filtered.sort_values("ts", ascending=False).reset_index(drop=True)
+
+        total = len(filtered)
+        total_pages = max(1, -(-total // page_size))
+        if "alerts_page" not in st.session_state:
+            st.session_state.alerts_page = 0
+        st.session_state.alerts_page = min(st.session_state.alerts_page, total_pages - 1)
+
+        st.divider()
+        pc1, pc2, pc3 = st.columns([1, 3, 1])
+        with pc1:
+            if st.button("\u2190 Prev", disabled=st.session_state.alerts_page <= 0, use_container_width=True):
+                st.session_state.alerts_page -= 1
+                st.rerun()
+        with pc2:
+            start = st.session_state.alerts_page * page_size
+            end = min(start + page_size, total)
+            st.markdown(
+                f"<div style='text-align:center; padding-top:8px; color:#8A8A93; "
+                f"font-family:\"IBM Plex Mono\",monospace; font-size:12px;'>"
+                f"Showing {start + 1 if total else 0}\u2013{end} of {total} alerts "
+                f"(page {st.session_state.alerts_page + 1}/{total_pages})</div>",
+                unsafe_allow_html=True,
             )
+        with pc3:
+            if st.button("Next \u2192", disabled=st.session_state.alerts_page >= total_pages - 1, use_container_width=True):
+                st.session_state.alerts_page += 1
+                st.rerun()
+
+        st.write("")
+
+        page_rows = filtered.iloc[start:end]
+        if page_rows.empty:
+            st.info("No alerts match the current filters.")
+
+        for idx, row in page_rows.iterrows():
+            alert_id = row["id"]
+            sev = str(row.get("severity", "")).lower()
+            sev_color = SEVERITY_COLORS.get(sev, "#6E6E76")
+            status = row.get("status", "Open")
+            status_color = STATUS_BADGE_COLORS.get(status, "#8A8A93")
+            try:
+                ts_display = datetime.fromtimestamp(float(row.get("ts"))).strftime("%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError, OSError):
+                ts_display = "-"
+
+            with st.container(border=True):
+                st.markdown(f"<div class='alert-accent' style='background:{sev_color};'></div>", unsafe_allow_html=True)
+                head_l, head_r = st.columns([5, 2])
+                with head_l:
+                    st.markdown(
+                        f"{badge(sev.upper() or 'INFO', sev_color)} "
+                        f"{badge(row.get('zone', ''), '#22D3EE')} "
+                        f"&nbsp;<span style='font-family:\"IBM Plex Mono\",monospace; font-size:12px; "
+                        f"color:#8A8A93;'>{row.get('note_type', '')}</span>",
+                        unsafe_allow_html=True,
+                    )
+                with head_r:
+                    st.markdown(
+                        f"<div style='text-align:right;'>{badge(status, status_color)}"
+                        f"<div class='alert-ts' style='margin-top:6px;'>{ts_display}</div></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                st.markdown(f"<div style='font-size:16px; margin:6px 0;'><b>{row.get('message', '')}</b></div>",
+                            unsafe_allow_html=True)
+                st.caption(f"{row.get('src_h', '?')} \u2192 {row.get('dst_h', '?')}")
+
+                b1, b2, b3, b4 = st.columns([1, 1, 1, 3])
+                with b1:
+                    if st.button("\u2705 Allow", key=f"allow_{idx}_{alert_id}", use_container_width=True):
+                        try:
+                            result = record_action(client, alert_id, row.get("src_h", ""),
+                                                    row.get("dst_h", ""), "allow", actor, "")
+                            st.cache_data.clear()
+                            st.session_state.action_feedback = {"type": "success", "text": f"Allowed: {result.detail}"}
+                        except Exception as e:
+                            st.session_state.action_feedback = {"type": "warning", "text": f"Action failed: {e}"}
+                        st.rerun()
+                with b2:
+                    if st.button("\u26d4 Block", key=f"block_{idx}_{alert_id}", use_container_width=True, type="primary"):
+                        try:
+                            result = record_action(client, alert_id, row.get("src_h", ""),
+                                                    row.get("dst_h", ""), "block", actor, "")
+                            st.cache_data.clear()
+                            fb_type = "warning" if result.status == "stubbed" else "success"
+                            st.session_state.action_feedback = {"type": fb_type, "text": f"Block recorded: {result.detail}"}
+                        except Exception as e:
+                            st.session_state.action_feedback = {"type": "warning", "text": f"Action failed: {e}"}
+                        st.rerun()
+                with b3:
+                    if st.button("\U0001F50D Investigate", key=f"investigate_{idx}_{alert_id}", use_container_width=True):
+                        try:
+                            result = record_action(client, alert_id, row.get("src_h", ""),
+                                                    row.get("dst_h", ""), "investigate", actor, "")
+                            st.cache_data.clear()
+                            st.session_state.action_feedback = {"type": "info", "text": "Marked for investigation."}
+                        except Exception as e:
+                            st.session_state.action_feedback = {"type": "warning", "text": f"Action failed: {e}"}
+                        st.rerun()
+                with b4:
+                    if row.get("action"):
+                        st.caption(f"Last action by **{row.get('actor', '?')}** \u2014 {row.get('notes') or 'no notes'}")
 
 with tab_cve:
     if cve_df.empty:

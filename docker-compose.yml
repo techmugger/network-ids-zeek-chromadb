@@ -7,13 +7,12 @@ services:
       - "9000:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-      # ClickHouse's official image auto-runs any .sql file placed here
-      # on first startup - this loads your schema automatically.
       - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     environment:
       - CLICKHOUSE_DB=siem
       - CLICKHOUSE_USER=siem_user
       - CLICKHOUSE_PASSWORD=changeme
+
   zeek:
     build: ./zeek
     container_name: ids_zeek
@@ -28,6 +27,7 @@ services:
     environment:
       - MODE=pcap
       - PCAP_FILE=/pcaps/sample.pcap
+
   ingest:
     build: ./ingest
     container_name: ids_ingest
@@ -35,37 +35,87 @@ services:
       - zeek_logs:/usr/local/zeek/logs:ro
     environment:
       - ZEEK_LOG_DIR=/usr/local/zeek/logs
-      - CLICKHOUSE_HOST=kko2zewbsi.germanywestcentral.azure.clickhouse.cloud
-      - CLICKHOUSE_PORT=8443
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=9Dq_66AAl9MVG
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=siem_user
+      - CLICKHOUSE_PASSWORD=changeme
       - CLICKHOUSE_DB=siem
-      - CLICKHOUSE_SECURE=true
+      - CLICKHOUSE_SECURE=false
+    depends_on:
+      clickhouse:
+        condition: service_started
+
   cve-matcher:
     build: ./cve
     container_name: ids_cve_matcher
     volumes:
       - ./cve/cve_data:/cve_data
     environment:
-      - CLICKHOUSE_HOST=kko2zewbsi.germanywestcentral.azure.clickhouse.cloud
-      - CLICKHOUSE_PORT=8443
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=9Dq_66AAl9MVG
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=siem_user
+      - CLICKHOUSE_PASSWORD=changeme
       - CLICKHOUSE_DB=siem
-      - CLICKHOUSE_SECURE=true
+      - CLICKHOUSE_SECURE=false
       - POLL_INTERVAL_SECONDS=30
+    depends_on:
+      clickhouse:
+        condition: service_started
+
   dashboard:
     build: ./dashboard
     container_name: ids_dashboard
     ports:
       - "8501:8501"
     environment:
-      - CLICKHOUSE_HOST=kko2zewbsi.germanywestcentral.azure.clickhouse.cloud
-      - CLICKHOUSE_PORT=8443
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=9Dq_66AAl9MVG
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=siem_user
+      - CLICKHOUSE_PASSWORD=changeme
       - CLICKHOUSE_DB=siem
-      - CLICKHOUSE_SECURE=true
+      - CLICKHOUSE_SECURE=false
+      - ADMIN_CONSOLE_URL=/
+    depends_on:
+      clickhouse:
+        condition: service_started
+
+  admin-console:
+    build: ./admin-console
+    container_name: ids_admin_console
+    restart: unless-stopped   # console has no ClickHouse retry loop; retry until DB is up
+    ports:
+      - "8000:8000"
+    environment:
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=8123
+      - CLICKHOUSE_USER=siem_user
+      - CLICKHOUSE_PASSWORD=changeme
+      - CLICKHOUSE_DB=siem
+      - CLICKHOUSE_SECURE=false
+      - ADMIN_USER=admin
+      - ADMIN_PASSWORD=changeme123
+      - AGENT_API_KEY=some-long-random-shared-secret-change-this
+    depends_on:
+      clickhouse:
+        condition: service_started
+
+  # --- Single front door: merges admin-console (at /) and the
+  # Streamlit dashboard (at /dashboard/) onto one site/port, per your
+  # "both should be on the same website" ask. The two services keep
+  # their own ports (8000, 8501) too, for direct local debugging -
+  # on the real testbed server, PROXY_PORT (default 8080) is the only
+  # port people need to be told about.
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: ids_proxy
+    restart: unless-stopped
+    ports:
+      - "${PROXY_PORT:-8080}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - admin-console
+      - dashboard
 
 volumes:
   zeek_logs:

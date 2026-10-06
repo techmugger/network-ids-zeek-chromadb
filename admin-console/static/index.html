@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>IDS Admin Console</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">IDS <span>Admin Console</span></div>
+    <div id="login-box" class="login-box">
+      <input id="login-user" type="text" placeholder="admin username" autocomplete="username">
+      <input id="login-pass" type="password" placeholder="admin password" autocomplete="current-password">
+      <input id="actor-name" type="text" placeholder="your name (analyst)" value="admin">
+      <button id="login-btn">Connect</button>
+      <span id="login-status"></span>
+    </div>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="agents">Agents</button>
+    <button class="tab-btn" data-tab="assets">Assets</button>
+    <button class="tab-btn" data-tab="alerts">Alerts</button>
+    <a class="tab-btn" href="/dashboard/" style="margin-left:auto; text-decoration:none;">&#8599; Dashboard</a>
+  </nav>
+
+  <main>
+    <section id="tab-agents" class="tab-panel active">
+      <div class="stat-row" id="agent-stats"></div>
+      <div class="panel-header">
+        <h2 id="agents-count">Agents</h2>
+        <div class="actions">
+          <button id="deploy-agent-btn" class="btn-primary">+ Deploy new agent</button>
+          <button id="refresh-agents">Refresh</button>
+        </div>
+      </div>
+      <table id="agents-table" class="data-table">
+        <thead>
+          <tr>
+            <th>Agent ID</th><th>Hostname</th><th>IP address</th><th>OS</th>
+            <th>Group</th><th>Version</th><th>Last check-in</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section id="tab-assets" class="tab-panel">
+      <div class="panel-header">
+        <h2>Assets</h2>
+        <div class="actions">
+          <button id="add-asset-btn" class="btn-primary">+ Add asset</button>
+          <button id="refresh-assets">Refresh</button>
+        </div>
+      </div>
+      <div id="add-asset-form" style="display:none; gap:8px; flex-wrap:wrap; align-items:center; margin:0 0 14px 0;">
+        <input id="new-asset-ip" class="small-input" placeholder="IP e.g. 192.168.56.10">
+        <select id="new-asset-zone" class="small-input"><option>IT</option><option>OT</option></select>
+        <input id="new-asset-owner" class="small-input" placeholder="owner">
+        <select id="new-asset-crit" class="small-input">
+          <option value="">criticality (unset)</option><option>low</option><option>medium</option><option>high</option><option>critical</option>
+        </select>
+        <input id="new-asset-tags" class="small-input" placeholder="tags e.g. ubuntu,sensor">
+        <button id="save-new-asset" class="btn-primary">Save asset</button>
+        <button id="cancel-new-asset">Cancel</button>
+      </div>
+      <table id="assets-table" class="data-table">
+        <thead>
+          <tr>
+            <th>IP</th><th>Zone</th><th>First seen</th><th>Last seen</th>
+            <th>Owner</th><th>Criticality</th><th>Tags</th><th>Policy</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section id="tab-alerts" class="tab-panel">
+      <div class="panel-header">
+        <h2>Alerts</h2>
+        <button id="refresh-alerts">Refresh</button>
+      </div>
+      <table id="alerts-table" class="data-table">
+        <thead>
+          <tr>
+            <th>Time</th><th>Type</th><th>Message</th><th>Src</th><th>Dst</th>
+            <th>Severity</th><th>Zone</th><th>Source</th><th>Status</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <div id="deploy-modal" class="modal-overlay">
+    <div class="modal-box">
+      <h3>Deploy a new sniffer agent</h3>
+      <p>Run this on the machine you want to monitor (Windows needs <a href="https://npcap.com" target="_blank" style="color:#22D3EE;">Npcap</a> installed first; Linux needs root/sudo for packet capture):</p>
+      <pre id="deploy-command"></pre>
+      <p style="color:#8A8A93; font-size:12px;">The agent will appear in the table above within ~30 seconds of starting.</p>
+      <button class="modal-close" onclick="document.getElementById('deploy-modal').classList.remove('show')">Close</button>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

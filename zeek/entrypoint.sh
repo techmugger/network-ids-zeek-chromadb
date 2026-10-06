@@ -9,7 +9,10 @@ echo "[zeek-entrypoint] MODE=${MODE:-pcap}"
 
 if [ "${MODE}" = "live" ]; then
     echo "[zeek-entrypoint] Starting live capture on ${LIVE_IFACE:-eth1}"
-    exec zeek -i "${LIVE_IFACE:-eth1}" local.zeek
+    # -C: ignore checksum errors. On VMs, NIC checksum offloading makes
+    # outgoing packets look "bad" to a sniffer, and Zeek would silently
+    # drop them - leaving conn.log missing half of every conversation.
+    exec zeek -C -i "${LIVE_IFACE:-eth1}" local.zeek
 
 else
     PCAP="${PCAP_FILE:-/pcaps/sample.pcap}"

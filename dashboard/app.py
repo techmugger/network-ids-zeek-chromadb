@@ -11,9 +11,18 @@ Correlation - kept deliberately simple/uncluttered per faculty
 guidance. A fourth "Analytics" tab holds deeper-dive charts
 (trends, IT/OT breakdown, protocol mix, etc.) for anyone who wants
 to explore further, without cluttering the core three views.
+
+READ-ONLY BY DESIGN: this dashboard no longer takes any analyst
+action. It still shows each alert's current status (Open / Allowed /
+Blocked / Investigating) by reading the same append-only
+`alert_actions` table the admin console writes to, but Allow / Block /
+Investigate buttons - and the enforcement hook they call - now live
+only in the admin-console service (see admin-console/main.py and
+admin-console/enforcement.py). One write path means one audit trail,
+with no risk of the dashboard and console recording conflicting
+decisions for the same alert.
 """
 
-import hashlib
 import os
 import time
 from datetime import datetime
@@ -23,8 +32,6 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-
-import enforcement
 
 st.set_page_config(page_title="IDS SIEM Dashboard", layout="wide", initial_sidebar_state="expanded")
 
@@ -160,7 +167,14 @@ SEVERITY_ROW_STYLE = {
     "info": "background-color: #1A1A1D; color: #B8B8BF;",
 }
 
-PROTOCOL_KEYWORDS = ["Modbus", "FTP", "SSH", "SMB", "HTTP", "HTTPS", "DNS", "RDP", "Telnet", "TFTP", "SNMP"]
+PROTOCOL_KEYWORDS = [
+    "Modbus", "FTP", "SSH", "SMB", "HTTP", "HTTPS", "DNS", "RDP", "Telnet", "TFTP", "SNMP",
+    # OT/SCADA - widened alongside ingest.py/sniffer_agent.py's OT_SERVICES
+    # for the SCADA lab testbed; matched case-insensitively against each
+    # alert's note_type+message text, same as the IT protocols above.
+    "DNP3", "S7comm", "BACnet", "EtherNet/IP", "CIP", "EtherCAT", "GE-SRTP",
+    "Genisys", "OPC UA", "PROFINET", "Synchrophasor", "BSAP", "IEC104", "HART-IP",
+]
 
 
 def style_by_severity(df: pd.DataFrame, col: str):
@@ -259,30 +273,13 @@ def table_to_df(_client, query: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def record_action(_client, alert_id: str, src_h: str, dst_h: str, action: str, actor: str, notes: str):
-    """Writes one row to alert_actions (never overwrites - this is an
-    audit log), calling the pluggable enforcement hook for block/allow
-    so the recorded enforcement_status reflects what actually happened
-    (or, today, what WOULD happen once a real backend exists)."""
-    if action == "block":
-        result = enforcement.apply_block(src_h, dst_h)
-    elif action == "allow":
-        result = enforcement.apply_allow(src_h, dst_h)
-    else:
-        result = enforcement.EnforcementResult(status="not_applicable", detail="Marked for investigation.")
-
-    row_id = hashlib.sha256(f"{alert_id}|{action}|{time.time()}".encode()).hexdigest()[:24]
-    _client.insert(
-        "alert_actions",
-        [[row_id, alert_id, action, actor, notes, result.status, result.detail, time.time()]],
-        column_names=["id", "alert_id", "action", "actor", "notes",
-                      "enforcement_status", "enforcement_detail", "ts"],
-    )
-    return result
-
-
 st.sidebar.title("IDS SIEM Dashboard")
-st.sidebar.caption("Zeek + ClickHouse + Python (Streamlit)")
+st.sidebar.caption("Zeek + ClickHouse + Python (Streamlit) \u2014 read-only")
+ADMIN_CONSOLE_PATH = os.environ.get("ADMIN_CONSOLE_URL", "/")
+st.sidebar.markdown(f"[\U0001F6E1\uFE0F Open Admin Console \u2192]({ADMIN_CONSOLE_PATH})")
+st.sidebar.caption("Allow / Block / Investigate and asset/agent management "
+                    "now live only in the Admin Console, to keep one single "
+                    "source of truth for who took what action.")
 auto_refresh = st.sidebar.toggle("Auto-refresh every 15s", value=True)
 if auto_refresh:
     st_autorefresh(interval=15_000, key="autorefresh")
@@ -434,23 +431,6 @@ with tab_alerts:
     if alerts_df.empty:
         st.info("No alerts yet.")
     else:
-        # Persistent action feedback - stays visible until the next action or
-        # manual dismissal, instead of a toast that vanishes in a couple seconds.
-        feedback = st.session_state.get("action_feedback")
-        if feedback:
-            fb_col, dismiss_col = st.columns([10, 1])
-            with fb_col:
-                if feedback["type"] == "warning":
-                    st.warning(feedback["text"])
-                elif feedback["type"] == "success":
-                    st.success(feedback["text"])
-                else:
-                    st.info(feedback["text"])
-            with dismiss_col:
-                if st.button("\u2715", key="dismiss_feedback"):
-                    st.session_state.action_feedback = None
-                    st.rerun()
-
         # Recent Actions - a real, live audit-trail feed straight from
         # alert_actions, not just a badge on one card. Shows the last 10
         # analyst decisions across ALL alerts, most recent first.
@@ -461,7 +441,7 @@ with tab_alerts:
         )
         with st.expander(f"\U0001F4CB Recent Actions ({len(recent_actions_df)})", expanded=bool(len(recent_actions_df))):
             if recent_actions_df.empty:
-                st.caption("No analyst actions recorded yet - use the buttons below on any alert.")
+                st.caption("No analyst actions recorded yet - take action from the Admin Console.")
             else:
                 lookup = alerts_df.set_index("id")["message"].to_dict() if "id" in alerts_df.columns else {}
                 for _, a in recent_actions_df.iterrows():
@@ -499,7 +479,6 @@ with tab_alerts:
                 search = st.text_input("Search message / host", key="alert_search")
             with fc4:
                 page_size = st.selectbox("Per page", [10, 15, 25, 50], index=1, key="page_size_select")
-            actor = st.text_input("Analyst name (applied to actions below)", value="analyst", key="actor_input")
 
         filtered = alerts_df[
             alerts_df["severity"].isin(selected_sev) & alerts_df["status"].isin(selected_status)
@@ -580,41 +559,14 @@ with tab_alerts:
                             unsafe_allow_html=True)
                 st.caption(f"{row.get('src_h', '?')} \u2192 {row.get('dst_h', '?')}")
 
-                b1, b2, b3, b4 = st.columns([1, 1, 1, 3])
-                with b1:
-                    if st.button("\u2705 Allow", key=f"allow_{idx}_{alert_id}", use_container_width=True):
-                        try:
-                            result = record_action(client, alert_id, row.get("src_h", ""),
-                                                    row.get("dst_h", ""), "allow", actor, "")
-                            st.cache_data.clear()
-                            st.session_state.action_feedback = {"type": "success", "text": f"Allowed: {result.detail}"}
-                        except Exception as e:
-                            st.session_state.action_feedback = {"type": "warning", "text": f"Action failed: {e}"}
-                        st.rerun()
-                with b2:
-                    if st.button("\u26d4 Block", key=f"block_{idx}_{alert_id}", use_container_width=True, type="primary"):
-                        try:
-                            result = record_action(client, alert_id, row.get("src_h", ""),
-                                                    row.get("dst_h", ""), "block", actor, "")
-                            st.cache_data.clear()
-                            fb_type = "warning" if result.status == "stubbed" else "success"
-                            st.session_state.action_feedback = {"type": fb_type, "text": f"Block recorded: {result.detail}"}
-                        except Exception as e:
-                            st.session_state.action_feedback = {"type": "warning", "text": f"Action failed: {e}"}
-                        st.rerun()
-                with b3:
-                    if st.button("\U0001F50D Investigate", key=f"investigate_{idx}_{alert_id}", use_container_width=True):
-                        try:
-                            result = record_action(client, alert_id, row.get("src_h", ""),
-                                                    row.get("dst_h", ""), "investigate", actor, "")
-                            st.cache_data.clear()
-                            st.session_state.action_feedback = {"type": "info", "text": "Marked for investigation."}
-                        except Exception as e:
-                            st.session_state.action_feedback = {"type": "warning", "text": f"Action failed: {e}"}
-                        st.rerun()
-                with b4:
-                    if row.get("action"):
-                        st.caption(f"Last action by **{row.get('actor', '?')}** \u2014 {row.get('notes') or 'no notes'}")
+                # Read-only: this card only ever displays the latest decision
+                # from alert_actions. Taking a new action (Allow/Block/
+                # Investigate) happens in the Admin Console, which is the
+                # only service that writes to this table.
+                if row.get("action"):
+                    st.caption(f"Last action by **{row.get('actor', '?')}** \u2014 {row.get('notes') or 'no notes'}")
+                else:
+                    st.caption("No action taken yet.")
 
 with tab_cve:
     if cve_df.empty:

@@ -1,0 +1,14 @@
+# docker-compose.live.yml - run Zeek on this machine's real network card
+# instead of replaying a pcap.
+#
+#   LIVE_IFACE=enp0s3 docker compose -f docker-compose.yml -f docker-compose.live.yml \
+#       up -d clickhouse zeek ingest admin-console
+#
+# Find your interface name with:  ip -br addr
+# network_mode: host is what lets the container see the VM's real NIC.
+services:
+  zeek:
+    network_mode: host
+    environment:
+      - MODE=live
+      - LIVE_IFACE=${LIVE_IFACE:-eth0}

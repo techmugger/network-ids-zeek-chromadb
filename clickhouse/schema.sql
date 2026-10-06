@@ -75,20 +75,82 @@ CREATE TABLE IF NOT EXISTS siem.mitre_matches (
 ) ENGINE = MergeTree()
 ORDER BY (source_key, id);
 
--- Response/enforcement layer (added for the analyst action workflow).
--- Append-only: every Allow/Block/Investigate click is a new row, never
--- an update. An alert's CURRENT status is the most recent row for its
--- alert_id, computed at query time with argMax() - this keeps a full
--- audit trail rather than overwriting history, which matters for a
--- product-grade SIEM (who decided what, and when).
+-- Response/enforcement layer (analyst action workflow). Append-only:
+-- every Allow/Block/Investigate click is a new row, never an update.
+-- Current status is the most recent row per alert_id via argMax(ts).
 CREATE TABLE IF NOT EXISTS siem.alert_actions (
     id String,
     alert_id String,
-    action String,               -- 'allow' | 'block' | 'investigate'
+    action String,
     actor String,
     notes String,
-    enforcement_status String,   -- 'stubbed' | 'applied' | 'failed' | 'not_applicable'
+    enforcement_status String,
     enforcement_detail String,
     ts Float64
 ) ENGINE = MergeTree()
 ORDER BY (alert_id, ts);
+
+-- Asset tracking (auto-discovered from traffic) - raw observations only.
+-- Admin-entered fields (owner, criticality, tags) live in a SEPARATE
+-- table (asset_admin) so re-ingesting traffic never overwrites edits.
+CREATE TABLE IF NOT EXISTS siem.asset_observations (
+    ip String,
+    zone String,
+    first_seen Float64,
+    last_seen Float64
+) ENGINE = MergeTree()
+ORDER BY ip;
+
+-- Admin-entered enrichment for an asset. Append-only - current values
+-- are the latest row per ip, via argMax(field, ts).
+CREATE TABLE IF NOT EXISTS siem.asset_admin (
+    ip String,
+    owner String,
+    criticality String,
+    tags String,
+    notes String,
+    actor String,
+    ts Float64
+) ENGINE = MergeTree()
+ORDER BY (ip, ts);
+
+-- Global IP policy (blacklist/whitelist/quarantine) - applies across ALL
+-- future alerts from this IP. Append-only, same argMax-by-ts pattern.
+CREATE TABLE IF NOT EXISTS siem.ip_policies (
+    id String,
+    ip String,
+    policy String,
+    actor String,
+    notes String,
+    enforcement_status String,
+    enforcement_detail String,
+    ts Float64
+) ENGINE = MergeTree()
+ORDER BY (ip, ts);
+
+-- Distributed sniffer agents (installed on individual endpoints, not
+-- just the central Zeek sensor). Append-only check-ins, same argMax
+-- pattern - "current" agent state is the latest check-in per agent_id.
+CREATE TABLE IF NOT EXISTS siem.agents (
+    agent_id String,
+    hostname String,
+    ip String,
+    os String,
+    agent_group String,
+    version String,
+    last_checkin Float64
+) ENGINE = MergeTree()
+ORDER BY (agent_id, last_checkin);
+
+-- Per-agent connection/zone/service counts. Agents append incremental
+-- counts each reporting cycle (not a full snapshot) - the dashboard
+-- SUMs across all rows per agent, so no truncate/delete is needed and
+-- multiple agents never step on each other's data.
+CREATE TABLE IF NOT EXISTS siem.agent_connection_stats (
+    agent_id String,
+    zone String,
+    service String,
+    count UInt64,
+    ts Float64
+) ENGINE = MergeTree()
+ORDER BY (agent_id, zone, service);

@@ -22,13 +22,14 @@
 @load policy/protocols/ssh/software
 
 ## --- OT / ICS protocols ---
-## ICSNPP packages (installed via zkg - see zeek/Dockerfile) provide
-## extended Modbus, DNP3, S7comm, and BACnet analyzers with dedicated
-## per-protocol logs instead of everything folding into conn.log's
-## generic "service" field. @load packages loads every zkg-installed
-## package at once, so nothing needs listing individually here - this
-## replaces the old bare `@load base/protocols/modbus` line and the
-## dead commented-out dnp3 line.
+## ICSNPP packages (installed via zkg - see zeek/Dockerfile for the
+## full list: Modbus, DNP3, S7comm, BACnet, EtherNet/IP+CIP, EtherCAT,
+## GE-SRTP, Genisys, OPC UA binary, PROFINET I/O, Synchrophasor, BSAP)
+## provide dedicated per-protocol logs instead of everything folding
+## into conn.log's generic "service" field. @load packages loads every
+## zkg-installed package at once, so nothing needs listing individually
+## here - this replaces the old bare `@load base/protocols/modbus` line
+## and the dead commented-out dnp3 line.
 @load packages
 
 ## --- Signature-based detection ---
@@ -41,8 +42,12 @@ redef signature_files += "signatures/custom.sig";
 ## --- Local network definition (adjust to your lab subnet) ---
 redef Site::local_nets += { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 };
 
-## --- Log rotation: keep it simple for a short-lived assignment demo ---
-redef Log::default_rotation_interval = 1 hr;
+## --- Log rotation: DISABLED. ingest.py tails conn.log/notice.log by file
+## path; when Zeek rotates hourly it renames the file, and ingest would
+## re-read the renamed copy from the start (duplicate alerts/counts).
+## Fine for a lab; for long-running production capture, use zeekctl and
+## point ingest at the live files only. ---
+redef Log::default_rotation_interval = 0 secs;
 
 ## --- Track software for all hosts, not just ones Zeek considers
 ## "local" by its own internal heuristics - ensures detections aren't

@@ -1,0 +1,131 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: #0A0A0C; color: #ECECEE;
+  font-family: 'Segoe UI', system-ui, sans-serif; font-size: 14px;
+}
+.topbar {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 24px; border-bottom: 1px solid #232327; background: #131316;
+}
+.brand { font-weight: 700; font-size: 18px; }
+.brand span { color: #8A8A93; font-weight: 400; }
+.login-box { display: flex; gap: 8px; align-items: center; }
+.login-box input {
+  background: #1A1A1D; border: 1px solid #2A2A2E; color: #ECECEE;
+  padding: 6px 10px; border-radius: 6px; font-size: 13px;
+}
+.login-box button {
+  background: #ECECEE; color: #0A0A0C; border: none; border-radius: 6px;
+  padding: 6px 14px; font-weight: 600; cursor: pointer;
+}
+#login-status { font-size: 12px; color: #8A8A93; }
+
+.tabs { display: flex; gap: 4px; padding: 12px 24px 0 24px; }
+.tab-btn {
+  background: #131316; border: 1px solid #232327; border-bottom: none;
+  color: #8A8A93; padding: 10px 20px; border-radius: 8px 8px 0 0; cursor: pointer;
+  font-weight: 500;
+}
+.tab-btn.active { background: #1A1A1D; color: #ECECEE; }
+
+main { padding: 0 24px 40px 24px; }
+.tab-panel { display: none; background: #1A1A1D; border: 1px solid #232327; border-radius: 0 8px 8px 8px; padding: 20px; }
+.tab-panel.active { display: block; }
+
+.panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+.panel-header h2 { margin: 0; font-size: 16px; }
+.panel-header button {
+  background: #232327; color: #ECECEE; border: 1px solid #2A2A2E;
+  padding: 6px 14px; border-radius: 6px; cursor: pointer;
+}
+.panel-header .actions { display: flex; gap: 8px; }
+.panel-header .btn-primary { background: #ECECEE; color: #0A0A0C; font-weight: 600; }
+
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.data-table th {
+  text-align: left; color: #8A8A93; font-weight: 600; text-transform: uppercase;
+  font-size: 11px; letter-spacing: 0.03em; padding: 8px 10px; border-bottom: 1px solid #232327;
+}
+.data-table td { padding: 10px; border-bottom: 1px solid #1F1F23; vertical-align: top; }
+.data-table tr:hover td { background: #1F1F23; }
+
+.badge {
+  display: inline-block; padding: 2px 10px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; border: 1px solid;
+}
+.badge-it { color: #22D3EE; border-color: #22D3EE66; background: #22D3EE22; }
+.badge-ot { color: #F59E0B; border-color: #F59E0B66; background: #F59E0B22; }
+.badge-critical { color: #EF4444; border-color: #EF444466; background: #EF444422; }
+.badge-high { color: #F59E0B; border-color: #F59E0B66; background: #F59E0B22; }
+.badge-medium { color: #FDBA74; border-color: #FDBA7466; background: #FDBA7422; }
+.badge-none { color: #8A8A93; border-color: #8A8A9366; background: #8A8A9322; }
+.badge-blacklist, .badge-quarantine { color: #EF4444; border-color: #EF444466; background: #EF444422; }
+.badge-whitelist { color: #34D399; border-color: #34D39966; background: #34D39922; }
+.badge-blocked { color: #EF4444; border-color: #EF444466; background: #EF444422; }
+.badge-allowed { color: #34D399; border-color: #34D39966; background: #34D39922; }
+.badge-investigating { color: #F59E0B; border-color: #F59E0B66; background: #F59E0B22; }
+.badge-open { color: #8A8A93; border-color: #8A8A9366; background: #8A8A9322; }
+.badge-active { color: #34D399; border-color: #34D39966; background: #34D39922; }
+.badge-disconnected { color: #EF4444; border-color: #EF444466; background: #EF444422; }
+
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.row-actions button {
+  border: 1px solid #2A2A2E; background: #232327; color: #ECECEE;
+  padding: 5px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 600;
+}
+.row-actions button:hover { filter: brightness(1.15); }
+.btn-allow { border-color: #34D39966 !important; color: #34D399 !important; }
+.btn-block { border-color: #EF444466 !important; color: #EF4444 !important; }
+.btn-investigate { border-color: #F59E0B66 !important; color: #F59E0B !important; }
+.btn-edit { border-color: #22D3EE66 !important; color: #22D3EE !important; }
+
+.small-input {
+  width: 90px; background: #1A1A1D; border: 1px solid #2A2A2E; color: #ECECEE;
+  padding: 4px 6px; border-radius: 4px; font-size: 12px;
+}
+
+.toast {
+  position: fixed; bottom: 24px; right: 24px; background: #1A1A1D;
+  border: 1px solid #2A2A2E; border-left: 4px solid #34D399; padding: 12px 18px;
+  border-radius: 8px; max-width: 380px; font-size: 13px; display: none; z-index: 100;
+}
+.toast.error { border-left-color: #EF4444; }
+.toast.show { display: block; }
+
+/* Agents page: stat cards with pure-CSS donut charts (conic-gradient) */
+.stat-row { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+.stat-card {
+  flex: 1; min-width: 240px; background: #131316; border: 1px solid #232327;
+  border-radius: 10px; padding: 16px; display: flex; align-items: center; gap: 18px;
+}
+.stat-card h4 {
+  margin: 0 0 10px 0; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+  color: #8A8A93; font-weight: 700;
+}
+.donut {
+  width: 84px; height: 84px; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+}
+.donut::after { content: ""; width: 48px; height: 48px; border-radius: 50%; background: #131316; }
+.stat-legend { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.legend-dot { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 6px; }
+
+/* Deploy Agent modal */
+.modal-overlay {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none;
+  align-items: center; justify-content: center; z-index: 200;
+}
+.modal-overlay.show { display: flex; }
+.modal-box {
+  background: #131316; border: 1px solid #232327; border-radius: 10px;
+  padding: 24px; max-width: 640px; width: 90%;
+}
+.modal-box h3 { margin-top: 0; }
+.modal-box pre {
+  background: #0A0A0C; border: 1px solid #232327; border-radius: 6px;
+  padding: 14px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+}
+.modal-box .modal-close {
+  margin-top: 12px; background: #232327; border: 1px solid #2A2A2E; color: #ECECEE;
+  padding: 8px 16px; border-radius: 6px; cursor: pointer;
+}

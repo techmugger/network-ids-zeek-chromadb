@@ -10,4 +10,4 @@ chroma_data/
 cve_data/*.json
 mitre_data/*.json
 .DS_Store
-.env
+!cve/cve_data/*.json

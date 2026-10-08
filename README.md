@@ -1,24 +1,35 @@
-# Network IDS - Zeek + ClickHouse + Semantic SIEM Dashboard
+# Live IT/OT Network IDS - Zeek + ClickHouse + Semantic SIEM Console
 
 ![Zeek](https://img.shields.io/badge/Zeek-IDS-blue) ![ClickHouse](https://img.shields.io/badge/ClickHouse-Analytics-yellow) ![Python](https://img.shields.io/badge/Python-3.11-yellow) ![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-red) ![Docker](https://img.shields.io/badge/Docker-Compose-2496ED)
 
-A lightweight SIEM (Security Information and Event Management) pipeline.
-Zeek watches network traffic and raises behavioral + signature-based
-alerts; those alerts are semantically correlated against real NVD CVE
-data and the MITRE ATT&CK Enterprise matrix, with everything - raw logs,
-reference data, embeddings, and correlation results - stored in
-ClickHouse. A Streamlit dashboard presents the result as a console-style
-SIEM console, and analysts can act directly on alerts (Allow / Block /
-Investigate) from the same screen.
+A lightweight, self-hosted IDS/SIEM appliance for mixed IT and OT
+(industrial) networks. Zeek **sniffs live traffic from a switch SPAN /
+mirror port** and raises behavioral + signature-based alerts; those alerts
+are semantically correlated against real NVD CVE data and the MITRE
+ATT&CK Enterprise matrix, with everything - raw logs, reference data,
+embeddings, and correlation results - stored in ClickHouse. Analysts use
+one web front door: an **admin console** (login, agents, assets, alerts,
+Allow / Block / Investigate actions) plus a read-only Streamlit
+**dashboard** of charts.
 
-**Current stack: Zeek -> ClickHouse -> Python (fuzzy + semantic matching,
-using ClickHouse's native `cosineDistance()`) -> Streamlit, hosted on
-Streamlit Community Cloud + ClickHouse Cloud.**
+**Current stack: Zeek (live capture) -> ClickHouse -> Python (fuzzy +
+semantic matching, using ClickHouse's native `cosineDistance()`) ->
+FastAPI admin console + Streamlit dashboard, behind an nginx proxy -
+all in Docker Compose on one sensor box.**
 
 ---
 
 ## Recent changes
 
+- **Live capture from a switch** - pcap replay removed. Zeek sniffs the
+  NIC named by `LIVE_IFACE` (`network_mode: host`), rotates logs hourly,
+  and `ingest` follows the active log files like `tail -F`, remembering
+  its position across restarts. See "Live capture" below.
+- **Single front door** - nginx publishes only port 8080: the admin
+  console at `/` and the read-only dashboard at `/dashboard/`.
+- **Admin console + distributed agents** - HTTP-Basic-protected console
+  with Agents / Assets / Alerts views; remote machines run
+  `agent/sniffer_agent.py` and report in with a shared API key.
 - **Analyst response actions** - each alert can be marked Allow / Block /
   Investigate directly from the dashboard. Every action is written to a
   new `alert_actions` audit table (append-only - a full history of who
@@ -26,9 +37,6 @@ Streamlit Community Cloud + ClickHouse Cloud.**
   module (`dashboard/enforcement.py`) that currently stubs real network
   enforcement, so the response workflow can be demoed before a live
   firewall/bridge backend exists. See "Response actions" below.
-- **Hosted on Streamlit Community Cloud**, backed by **ClickHouse
-  Cloud** instead of a local-only container, so the dashboard is
-  reachable without running Docker locally.
 - **Fixed an OT-traffic undercount bug**: Zeek's actual DNP3 service
   label is `dnp3_tcp` (not `dnp3`), and Zeek sometimes writes a
   comma-joined service string (e.g. `"ssl,modbus"`) when more than one
@@ -68,26 +76,26 @@ between two devices), not for SPAN.
 
 ```mermaid
 flowchart TD
-    A[Network Traffic] -->|live SPAN port| B["zeek<br/>(detection engine)<br/>signatures + local.zeek<br/>port-scan detector, Modbus policy<br/>ICSNPP: Modbus/DNP3/S7comm/BACnet"]
-    B -->|conn.log, notice.log, etc.| C["ingest<br/>parses Zeek logs into ClickHouse"]
-    C --> D[(ClickHouse Cloud)]
+    SW[Switch SPAN / mirror port] -->|live packets| B["zeek<br/>(detection engine)<br/>signatures + local.zeek<br/>port-scan detector, Modbus policy<br/>ICSNPP: Modbus/DNP3/S7comm/BACnet"]
+    B -->|conn.log, notice.log, etc.| C["ingest<br/>follows live logs into ClickHouse"]
+    C --> D[(ClickHouse)]
     D --> E["cve-matcher<br/>fuzzy + semantic CVE matching<br/>semantic MITRE matching<br/>(cosineDistance in SQL)"]
     E --> D
-    D --> F["dashboard (Streamlit Cloud)<br/>01 Alerts | 02 CVE Matches<br/>03 MITRE ATT&CK | 04 Analytics"]
-    F -->|Allow / Block / Investigate| G["enforcement.py<br/>(stubbed today)"]
-    F -->|audit log| D
-
-    subgraph ClickHouse Tables
-        D
-    end
+    AG["sniffer agents<br/>(other hosts)"] -->|HTTP + API key| AC
+    D <--> AC["admin-console (FastAPI)<br/>Agents | Assets | Alerts<br/>Allow / Block / Investigate"]
+    D --> F["dashboard (Streamlit, read-only)<br/>Alerts | CVE | MITRE | Analytics"]
+    AC --> G["enforcement.py<br/>(stubbed today)"]
+    P["nginx proxy :8080"] --> AC
+    P --> F
 ```
 
-All services run as separate containers via `docker-compose.yml`,
-communicating over the compose network (or pointed at ClickHouse Cloud
-for the hosted dashboard). **ClickHouse is the single source of
-truth.** Tables: `alerts`, `software`, `cve_descriptions`,
-`mitre_attack`, `cve_matches`, `mitre_matches`, `connection_stats`,
-`alert_actions`.
+All services run as separate containers via `docker-compose.yml`. Only
+the nginx proxy publishes a port (`PROXY_PORT`, default 8080); ClickHouse,
+the dashboard and the admin console are reachable only on the internal
+Docker network. **ClickHouse is the single source of truth.** Tables:
+`alerts`, `software`, `cve_descriptions`, `mitre_attack`, `cve_matches`,
+`mitre_matches`, `connection_stats`, `alert_actions`, plus the agent and
+asset tables defined in `clickhouse/schema.sql`.
 
 ---
 
@@ -112,7 +120,7 @@ than needing a separate vector-only store.
 ## 3. Service-by-service breakdown
 
 ### `zeek`
-Runs Zeek against captured/replayed traffic. Two custom detection
+Runs Zeek against live traffic on the capture NIC. Two custom detection
 mechanisms sit alongside Zeek's built-in signature framework:
 - **Port-scan detector** (`ScanDetect::Possible_Port_Scan`) -- behavioral,
   flags a host touching many distinct destination ports in a short window.
@@ -156,33 +164,47 @@ Runs two independent matching passes in a loop:
    commit to ClickHouse every 5 alerts rather than in one batch at the
    end, so a crash mid-run only loses a few seconds of work.
 
-### `clickhouse` (ClickHouse Cloud in the hosted deployment)
+### `clickhouse`
 The single data store. Tables: `alerts`, `software`, `cve_descriptions`,
 `mitre_attack` (reference data with embeddings, rebuilt every 15 minutes
 from cached NVD/MITRE JSON), `cve_matches`, `mitre_matches`,
 `connection_stats`, `alert_actions` (results + audit log). Schema loads
-automatically on first startup from `clickhouse/schema.sql` for local
-runs; for ClickHouse Cloud, run the same file's statements once via the
-Cloud SQL console.
+automatically on first startup from `clickhouse/schema.sql`.
 
-### `dashboard` (`app.py`, Streamlit, hosted on Streamlit Community Cloud)
+### `dashboard` (`app.py`, Streamlit, read-only, served at `/dashboard/`)
 Reads directly from ClickHouse via SQL and renders four tabs:
-- **[01] Alerts** -- per-alert cards with severity/zone/status badges,
-  a live "Recent Actions" audit feed, and inline **Allow / Block /
-  Investigate** buttons on every card (see "Response actions" below).
+- **[01] Alerts** -- per-alert cards with severity/zone/status badges and
+  a recent-actions audit feed.
 - **[02] CVE Matches** -- matched software/CVE pairs with CVSS scores.
 - **[03] MITRE ATT&CK** -- matched alert/technique pairs with a
   tactic-distribution chart.
-- **[04] Analytics** -- deeper-dive views: IT vs OT traffic split, full
-  protocol/service mix (from real `conn.log` data), alert trends over
-  time, top source hosts, CVSS distribution, and most common ATT&CK
-  techniques.
+- **[04] Analytics** -- IT vs OT traffic split, full protocol/service mix
+  (from real `conn.log` data), alert trends over time, top source hosts,
+  CVSS distribution, and most common ATT&CK techniques.
+
+### `admin-console` (`admin-console/main.py`, FastAPI, served at `/`)
+The operator-facing site (static UI in `admin-console/static/`).
+- **Login**: HTTP Basic, credentials from `ADMIN_USER` / `ADMIN_PASSWORD`.
+- **Agents** -- machines running `agent/sniffer_agent.py` check in every
+  ~30 s and show as active / disconnected; the install page shows the
+  shared key.
+- **Assets** -- discovered hosts, manual add, admin notes and per-asset
+  policy.
+- **Alerts** -- alert list with **Allow / Block / Investigate** actions.
+- **API**: `/api/assets`, `/api/alerts`, `/api/alerts/action`,
+  `/api/agents`, `/api/agents/install-info` (admin login);
+  `/api/agents/checkin` and `/api/agents/logs` (agents, header
+  `X-Agent-Key` = `AGENT_API_KEY`).
+
+### `proxy` (nginx, `nginx/nginx.conf`)
+Single front door on `PROXY_PORT` (default 8080): `/` -> admin console,
+`/dashboard/` -> Streamlit (including its websocket).
 
 ---
 
 ## 4. Response actions (Allow / Block / Investigate)
 
-Every alert card has three action buttons. Clicking one:
+Every alert in the admin console has three actions. Clicking one:
 
 1. Writes a row to **`alert_actions`** (append-only - never overwritten,
    so the full decision history survives, not just the latest state).
@@ -190,56 +212,41 @@ Every alert card has three action buttons. Clicking one:
    **today only report back what would happen** - no live network
    enforcement backend exists yet. `Investigate` skips enforcement
    entirely and is a pure triage flag.
-3. Updates the alert's Status badge (Open / Allowed / Blocked /
-   Investigating), computed as the most recent action per alert via
-   `argMax(action, ts)` - so status always reflects the latest decision
-   even though every past decision is preserved.
+3. Updates the alert's Status (Open / Allowed / Blocked / Investigating),
+   computed as the most recent action per alert via `argMax(action, ts)`.
 
 **To go live later:** replace the body of `apply_block()` in
-`dashboard/enforcement.py` with a real call - e.g. SSH into the bridge
-host set up by `setup_bridge.sh` and push an `nftables`/`iptables` rule,
-or call a firewall/SDN controller's API. `app.py` never needs to
-change - it only depends on the `EnforcementResult` shape the module
-returns, so swapping the backend is a self-contained change.
+`admin-console/enforcement.py` with a real call - e.g. SSH into the
+bridge host set up by `zeek/setup_bridge.sh` and push an
+`nftables`/`iptables` rule, or call a firewall/SDN controller's API.
 
 ---
 
-## 5. Hosting
+## 5. Deployment (sensor box)
 
-- **Dashboard**: Streamlit Community Cloud, deployed from this repo's
-  `main` branch, entry point `dashboard/app.py`.
-- **Database**: ClickHouse Cloud. Credentials are supplied via
-  Streamlit's **Secrets** panel (`st.secrets["clickhouse"]`) rather than
-  environment variables, since Streamlit Cloud has no plain env var
-  mechanism. `app.py`'s `_config()` helper checks `st.secrets` first and
-  falls back to environment variables, so the same code runs unchanged
-  against a local Docker `clickhouse` service.
-- **Local Docker Compose** still works standalone (its own `clickhouse`
-  service, schema auto-loaded via `docker-entrypoint-initdb.d`) for
-  development without touching the hosted Cloud data.
+Everything runs with Docker Compose on one Linux box (tested target: a
+fanless 6-port industrial mini PC with Ubuntu Server). Use one NIC for
+management (SSH + web UI) and a different NIC for capture.
+
+1. Install Ubuntu Server (with OpenSSH) and Docker.
+2. `git clone` this repo, `cp .env.example .env`, set `LIVE_IFACE`.
+3. **Change the default secrets in `docker-compose.yml`** before putting
+   the box on a shared network: `CLICKHOUSE_PASSWORD`, `ADMIN_PASSWORD`,
+   `AGENT_API_KEY`.
+4. `docker compose up -d --build`, then open `http://<box-ip>:8080`.
+
+The CVE/MITRE reference datasets live in `cve/cve_data/`. If they are
+missing, `cve-matcher` downloads them on first start (needs internet).
 
 ---
 
-## 6. How to run it locally
+## 6. Day-to-day commands
 
 ```bash
-# Bring up the data store first - schema auto-loads on first start
-docker compose up -d clickhouse
-
-# Bring up the dashboard (reads existing ClickHouse data)
-docker compose up -d dashboard
-# then open http://localhost:8501
-```
-
-To regenerate correlations from scratch (e.g. after new Zeek data):
-
-```bash
-docker compose up -d zeek ingest
-# wait for ingest to finish, then:
-docker compose up -d cve-matcher
-docker compose logs -f cve-matcher
-# once "MITRE pass complete" appears and CVE matching has settled:
-docker compose stop cve-matcher
+docker compose ps                      # are all services up?
+docker compose logs -f zeek ingest     # capture + ingestion
+docker compose logs -f cve-matcher     # correlation passes
+docker compose down -v                 # wipe ALL data and start fresh
 ```
 
 ---
@@ -255,10 +262,10 @@ docker compose stop cve-matcher
   before every semantic query, then compared via ClickHouse's
   `cosineDistance()` -- that step is visible in `match_cve.py` rather
   than hidden inside a vector database.
-- **PyArrow/pandas versions are constrained** in `dashboard/requirements.txt`
-  and `dashboard/runtime.txt` pins Python to 3.11, to avoid Streamlit
-  Cloud falling back to a from-source build of pandas that fails on the
-  build image.
+- **Live capture is rotation-safe** -- Zeek rotates logs hourly; `ingest`
+  keeps the old file open until fully read, never reads half-written
+  lines, and saves its offset so a restart neither duplicates alerts nor
+  resets connection counts.
 - **`alert_actions` is append-only by design** -- current status is a
   query-time aggregate (`argMax` by timestamp), not a mutated field, so
   the audit trail is never lost.
@@ -299,27 +306,34 @@ columns and SQL functions rather than a dedicated vector database.
 
 ```
 docker-compose.yml        - orchestrates all services
+.env.example              - LIVE_IFACE, BPF filter, retention, proxy port
 clickhouse/
-  schema.sql               - table definitions, auto-loaded locally on first start
+  schema.sql               - table definitions, auto-loaded on first start
 zeek/
-  local.zeek               - Zeek script config, loads custom detectors + ICSNPP packages
-  signatures/               - signature framework rules
-  entrypoint.sh
-  Dockerfile
-cve/
-  match_cve.py              - CVE + MITRE matching logic (ClickHouse + cosineDistance)
-  fetch_cve.py               - pulls NVD CVE data
-  fetch_mitre.py              - pulls MITRE ATT&CK Enterprise data
-  cve_data/                    - cached reference datasets
-  entrypoint.sh
-  Dockerfile
-dashboard/
-  app.py                    - Streamlit SIEM console (4 tabs + response actions)
-  enforcement.py             - pluggable Allow/Block enforcement hook (stubbed)
-  requirements.txt          - streamlit, clickhouse-connect, pandas, plotly
-  runtime.txt                - pins Python 3.11 for Streamlit Cloud builds
+  local.zeek               - Zeek config: custom detectors, ICSNPP packages, hourly rotation
+  signatures/custom.sig    - signature framework rules
+  entrypoint.sh            - live capture startup (NIC prep, BPF, log cleanup)
+  setup_bridge.sh          - only for INLINE deployment (not needed for SPAN)
   Dockerfile
 ingest/
-  ingest.py                 - parses Zeek logs into ClickHouse
+  ingest.py                - follows live Zeek logs into ClickHouse (tail -F style)
+cve/
+  match_cve.py             - CVE + MITRE matching (ClickHouse + cosineDistance)
+  fetch_cve.py             - pulls NVD CVE data
+  fetch_mitre.py           - pulls MITRE ATT&CK Enterprise data
+  cve_data/                - cached reference datasets (cve_local.json, mitre_local.json)
+  entrypoint.sh, Dockerfile
+dashboard/
+  app.py                   - read-only Streamlit charts (4 tabs)
+  enforcement.py, requirements.txt, runtime.txt, Dockerfile
+admin-console/
+  main.py                  - FastAPI: login, agents, assets, alerts, actions
+  enforcement.py           - pluggable Allow/Block hook (stubbed)
+  static/                  - index.html, app.js, style.css
   Dockerfile
+nginx/
+  nginx.conf               - single front door (/ and /dashboard/)
+agent/
+  sniffer_agent.py         - lightweight agent for other Windows/Linux hosts
+  ids-agent.service        - systemd unit for the agent on Linux
 ```

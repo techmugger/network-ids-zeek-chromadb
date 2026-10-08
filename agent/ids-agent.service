@@ -1,0 +1,18 @@
+# Install on a monitored Linux host:
+#   sudo cp ids-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ids-agent
+# Edit --server, --api-key and --interface first.
+# NOTE: do not run this on the sensor box that already runs Zeek.
+[Unit]
+Description=IDS sniffer agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/ids-agent/sniffer_agent.py --server http://SERVER_IP:8080 --api-key CHANGE_ME --group default --interface eth0
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

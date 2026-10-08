@@ -40,11 +40,35 @@ Streamlit Community Cloud + ClickHouse Cloud.**
 
 ---
 
+
+## Live capture from a switch (SPAN / mirror port)
+
+Zeek sniffs a real network card; pcap replay has been removed.
+
+1. On the switch, mirror the traffic you want to inspect to one port
+   (SPAN / port mirroring - needs a *managed* switch).
+2. Plug that switch port into a spare NIC on the sensor box. Use a
+   *different* NIC for SSH / the web UI.
+3. Find the NIC name with `ip -br link` (plug the cable in and watch which
+   one shows `UP`), then `cp .env.example .env` and set `LIVE_IFACE`.
+4. `docker compose up -d --build`
+5. Check: `docker logs ids_zeek` (should say "Live capture on ..."),
+   then `docker exec ids_zeek ls -la /usr/local/zeek/logs` - `conn.log`
+   should grow within a minute. The UI is at `http://<box-ip>:8080`.
+
+The zeek container sets the NIC to promiscuous mode and turns off
+GRO/LRO/TSO/GSO on every start. Zeek rotates logs hourly; ingest follows
+the active files and remembers its position across restarts; rotated logs
+are deleted after `LOG_RETENTION_DAYS` (default 7).
+
+`zeek/setup_bridge.sh` is only needed for an *inline* deployment (box
+between two devices), not for SPAN.
+
 ## 1. Architecture diagram
 
 ```mermaid
 flowchart TD
-    A[Network Traffic] -->|pcap / live| B["zeek<br/>(detection engine)<br/>signatures + local.zeek<br/>port-scan detector, Modbus policy<br/>ICSNPP: Modbus/DNP3/S7comm/BACnet"]
+    A[Network Traffic] -->|live SPAN port| B["zeek<br/>(detection engine)<br/>signatures + local.zeek<br/>port-scan detector, Modbus policy<br/>ICSNPP: Modbus/DNP3/S7comm/BACnet"]
     B -->|conn.log, notice.log, etc.| C["ingest<br/>parses Zeek logs into ClickHouse"]
     C --> D[(ClickHouse Cloud)]
     D --> E["cve-matcher<br/>fuzzy + semantic CVE matching<br/>semantic MITRE matching<br/>(cosineDistance in SQL)"]

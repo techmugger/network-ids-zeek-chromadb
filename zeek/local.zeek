@@ -42,12 +42,11 @@ redef signature_files += "signatures/custom.sig";
 ## --- Local network definition (adjust to your lab subnet) ---
 redef Site::local_nets += { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 };
 
-## --- Log rotation: DISABLED. ingest.py tails conn.log/notice.log by file
-## path; when Zeek rotates hourly it renames the file, and ingest would
-## re-read the renamed copy from the start (duplicate alerts/counts).
-## Fine for a lab; for long-running production capture, use zeekctl and
-## point ingest at the live files only. ---
-redef Log::default_rotation_interval = 0 secs;
+## --- Log rotation: hourly. Live capture never ends, so logs must rotate
+## or the disk fills. ingest.py follows the active file like `tail -F`
+## (it keeps the old file open until it is fully read, then switches),
+## and zeek/entrypoint.sh deletes rotated copies after LOG_RETENTION_DAYS. ---
+redef Log::default_rotation_interval = 1 hr;
 
 ## --- Track software for all hosts, not just ones Zeek considers
 ## "local" by its own internal heuristics - ensures detections aren't

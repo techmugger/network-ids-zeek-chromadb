@@ -2,7 +2,8 @@
 # setup_bridge.sh
 #
 # Run this ON THE HOST (not inside a container) when you're ready to
-# move from PCAP-replay mode to live inline capture, per the
+# use the box INLINE (traffic passing through it) - NOT needed for a
+# switch SPAN/mirror port, where Zeek just listens on one NIC. Per the
 # "traffic from eth0 to go through IDS and out eth1" requirement.
 #
 # This creates a Linux bridge joining eth0 and eth1 so traffic flows
@@ -30,4 +31,4 @@ ip link set "$IFACE_OUT" up promisc on
 ip link set "$BRIDGE" up promisc on
 
 echo "[setup_bridge] Done. Verify with: brctl show   (or) ip link show type bridge"
-echo "[setup_bridge] Now run the zeek container with MODE=live, LIVE_IFACE=$BRIDGE, network_mode: host"
+echo "[setup_bridge] Now set LIVE_IFACE=$BRIDGE in .env and run docker compose up -d"

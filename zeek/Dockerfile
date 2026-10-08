@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         gnupg2 \
         ca-certificates \
-        tcpreplay \
+        ethtool \
         iproute2 \
         net-tools \
         python3 \
@@ -29,20 +29,36 @@ ENV PATH="/opt/zeek/bin:/usr/local/zeek/bin:${PATH}"
 RUN ln -s /opt/zeek /usr/local/zeek || true
 
 # ---------------------------------------------------------------
+# Build tools. Most ICSNPP packages compile a Spicy analyzer during
+# `zkg install`, which needs CMake and a C++ toolchain. The Zeek 9
+# package is configured to use /usr/bin/g++-12 specifically, so
+# g++-12 is required (Ubuntu 22.04's default g++ is 11, which is not
+# enough for the packages that compile at install time).
+# ---------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake \
+        g++ \
+        g++-12 \
+        make \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------
 # OT/ICS protocol support: Zeek ships a bare-bones Modbus analyzer
 # built in. CISA/INL's ICSNPP packages replace/extend it and add
 # proper per-protocol logging (dedicated modbus.log / dnp3.log /
 # s7comm.log / bacnet.log / etc. instead of everything folding into
-# conn.log's generic "service" field). Each install is best-effort,
-# same pattern as before - a network hiccup, or one package not
-# existing for this Zeek version, shouldn't break the whole image.
+# conn.log's generic "service" field).
 #
-# This is the full published ICSNPP set as of writing (see
-# https://github.com/cisagov/ICSNPP and packages.zeek.org) plus
-# requires_spicy for the two that need the Spicy parser toolkit.
 # Covers: Modbus, DNP3, S7comm/S7comm-plus, BACnet, EtherNet/IP+CIP,
 # EtherCAT, GE-SRTP, Genisys, OPC UA (binary), PROFINET I/O context
 # manager, Synchrophasor (IEEE C37.118), and BSAP.
+#
+# Each install loop tries every package in its group, prints the zkg
+# build log for any that fail, and FAILS THE BUILD if any package is
+# missing, so a broken install can no longer hide behind a
+# "successful" image. Packages are split into separate RUN steps so
+# earlier groups stay cached if a later one needs another fix.
 #
 # NOT covered by any ICSNPP (or other Zeek) parser as of writing:
 # IEC 60870-5-104, HART-IP, ICCP/TASE.2, IEC 61850 (GOOSE/MMS), and
@@ -55,19 +71,34 @@ RUN ln -s /opt/zeek /usr/local/zeek || true
 # to matter for your SCADA lab specifically.
 # ---------------------------------------------------------------
 RUN zkg autoconfig --force || true
-RUN zkg install --force cisagov/icsnpp-modbus       || echo "icsnpp-modbus install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-dnp3         || echo "icsnpp-dnp3 install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-s7comm       || echo "icsnpp-s7comm install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-bacnet       || echo "icsnpp-bacnet install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-enip         || echo "icsnpp-enip (EtherNet/IP+CIP) install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-ethercat     || echo "icsnpp-ethercat install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-ge-srtp      || echo "icsnpp-ge-srtp install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-genisys      || echo "icsnpp-genisys install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-opcua-binary || echo "icsnpp-opcua-binary install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-profinet-io-cm || echo "icsnpp-profinet-io-cm install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-synchrophasor || echo "icsnpp-synchrophasor install skipped - add manually if needed"
-RUN zkg install --force cisagov/icsnpp-bsap         || echo "icsnpp-bsap install skipped - add manually if needed"
 
+# Group 1: packages that build without g++-12 specifics
+RUN failed=""; \
+    for p in modbus dnp3 s7comm bacnet enip ethercat opcua-binary bsap; do \
+      echo "=== installing icsnpp-$p ==="; \
+      zkg install --force cisagov/icsnpp-$p || { \
+        failed="$failed $p"; \
+        echo "--- build log for icsnpp-$p ---"; \
+        tail -40 /opt/zeek/var/lib/zkg/logs/icsnpp-$p-build.log 2>/dev/null || true; }; \
+    done; \
+    echo "FAILED PACKAGES (group 1):[$failed]"; \
+    [ -z "$failed" ]
+
+# Group 2: packages that need g++-12 to compile their analyzers
+RUN failed=""; \
+    for p in ge-srtp genisys synchrophasor; do \
+      echo "=== installing icsnpp-$p ==="; \
+      zkg install --force cisagov/icsnpp-$p || { \
+        failed="$failed $p"; \
+        echo "--- build log for icsnpp-$p ---"; \
+        tail -40 /opt/zeek/var/lib/zkg/logs/icsnpp-$p-build.log 2>/dev/null || true; }; \
+    done; \
+    echo "FAILED PACKAGES (group 2):[$failed]"; \
+    [ -z "$failed" ]
+
+
+# Smoke test: fail the build if any installed analyzer can't load.
+RUN zkg list && zeek -e 'event zeek_init() { print "ZEEK_LOAD_OK"; }'
 WORKDIR /usr/local/zeek
 
 COPY entrypoint.sh /entrypoint.sh

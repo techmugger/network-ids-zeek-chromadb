@@ -28,9 +28,14 @@ BSAP - not just the original Modbus/DNP3/S7comm/BACnet four), plus
 port-only fallbacks for IEC 60870-5-104 and HART-IP, which have no
 Zeek/ICSNPP parser at all. See the comments above each set for which
 protocols rely on port-matching vs. real Zeek content detection.
+
+CHANGED FOR LIVE CAPTURE (switch SPAN port): Zeek now runs forever and
+rotates its logs hourly, so ingest follows the ACTIVE log files like
+`tail -F` (see LogFollower) instead of globbing every conn*.log. It
+remembers where it stopped in a small state file, so restarting the
+container neither re-reads old lines nor loses the running counts.
 """
 
-import glob
 import hashlib
 import ipaddress
 import json
@@ -52,6 +57,8 @@ CLICKHOUSE_PASSWORD = os.environ.get("CLICKHOUSE_PASSWORD", "changeme")
 CLICKHOUSE_DB = os.environ.get("CLICKHOUSE_DB", "siem")
 CLICKHOUSE_SECURE = os.environ.get("CLICKHOUSE_SECURE", "false").lower() == "true"
 POLL_SECONDS = float(os.environ.get("POLL_SECONDS", "3"))
+# Where ingest remembers how far it has read (mount a volume here).
+STATE_FILE = os.environ.get("STATE_FILE", "/state/ingest_state.json")
 # How often newly seen / updated hosts are written to asset_observations.
 ASSET_FLUSH_SECONDS = float(os.environ.get("ASSET_FLUSH_SECONDS", "30"))
 
@@ -164,31 +171,148 @@ def connect_clickhouse(retries=15, delay=3):
     raise RuntimeError("Could not connect to ClickHouse")
 
 
-def find_log_files(basename: str):
-    stem = basename.replace(".log", "")
-    pattern = os.path.join(ZEEK_LOG_DIR, "**", f"{stem}*.log")
-    return glob.glob(pattern, recursive=True)
+def first_line_fingerprint(path):
+    """Hash of a file's first complete line, '' if none yet. Used to tell a
+    brand-new log from the old one when the OS reuses an inode number."""
+    try:
+        with open(path, "rb") as f:
+            line = f.readline()
+    except OSError:
+        return ""
+    if not line.endswith(b"\n"):
+        return ""
+    return hashlib.sha1(line).hexdigest()
 
 
-class FileTailer:
-    def __init__(self):
-        self.offsets = {}
+class LogFollower:
+    """`tail -F` for Zeek logs: returns only complete, new lines.
+
+    - Keeps each log open, so when Zeek rotates it (renames conn.log and
+      starts a fresh one) the remainder of the old file is still read
+      before switching to the new one - nothing lost, nothing read twice.
+    - Never returns a half-written line.
+    - Persists (inode, offset, first-line hash) to STATE_FILE so an ingest
+      restart resumes exactly where it stopped.
+    """
+
+    def __init__(self, state_file):
+        self.state_file = state_file
+        self.state = {}      # path -> {"inode", "offset", "first"}
+        self.handles = {}    # path -> open file object
+        self.loaded = False  # True if a previous state file was found
+        self.dirty = False
+        try:
+            with open(state_file) as f:
+                self.state = json.load(f)
+            self.loaded = True
+            log.info(f"Resumed ingest state from {state_file}")
+        except (OSError, ValueError):
+            log.info("No previous ingest state - starting from the beginning of the live logs")
+
+    def _drain(self, path, fh):
+        lines = []
+        while True:
+            pos = fh.tell()
+            line = fh.readline()
+            if not line:
+                break
+            if not line.endswith("\n"):
+                fh.seek(pos)          # partial line, wait for the rest
+                break
+            lines.append(line)
+        return lines
+
+    def _remember(self, path, fh):
+        inode = os.fstat(fh.fileno()).st_ino
+        rec = self.state.get(path, {})
+        offset = fh.tell()
+        first = rec.get("first", "")
+        if not first and offset > 0:
+            first = first_line_fingerprint(path)
+        new = {"inode": inode, "offset": offset, "first": first}
+        if new != rec:
+            self.state[path] = new
+            self.dirty = True
+
+    def _open(self, path):
+        fh = open(path, "r", errors="ignore")
+        rec = self.state.get(path)
+        st = os.fstat(fh.fileno())
+        if (rec and rec.get("inode") == st.st_ino
+                and rec.get("offset", 0) <= st.st_size
+                and (rec.get("offset", 0) == 0
+                     or rec.get("first") == first_line_fingerprint(path))):
+            fh.seek(rec["offset"])
+        return fh
 
     def read_new_lines(self, path):
-        try:
-            size = os.path.getsize(path)
-        except OSError:
-            return []
-        start = self.offsets.get(path, 0)
-        if size < start:
-            start = 0
-        if size == start:
-            return []
-        with open(path, "r", errors="ignore") as f:
-            f.seek(start)
-            lines = f.readlines()
-        self.offsets[path] = size
+        lines = []
+        fh = self.handles.get(path)
+
+        if fh is not None:
+            try:
+                cur_inode = os.stat(path).st_ino
+            except OSError:
+                cur_inode = None                      # file gone / mid-rotation
+            if cur_inode != os.fstat(fh.fileno()).st_ino:
+                # Rotated: finish the old file completely, then move on.
+                lines += self._drain(path, fh)
+                fh.close()
+                self.handles.pop(path, None)
+                self.state.pop(path, None)
+                self.dirty = True
+                fh = None
+
+        if fh is None:
+            if not os.path.exists(path):
+                return lines
+            try:
+                fh = self._open(path)
+            except OSError:
+                return lines
+            self.handles[path] = fh
+
+        # Truncated in place (should not happen with Zeek, but be safe).
+        if os.fstat(fh.fileno()).st_size < fh.tell():
+            fh.seek(0)
+            self.state.pop(path, None)
+
+        lines += self._drain(path, fh)
+        self._remember(path, fh)
         return lines
+
+    def save(self):
+        if not self.dirty:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.state_file) or ".", exist_ok=True)
+            tmp = self.state_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(self.state, f)
+            os.replace(tmp, self.state_file)
+            self.dirty = False
+        except OSError as e:
+            log.warning(f"Could not save ingest state ({e}); a restart will re-read the live logs")
+
+
+def log_path(basename: str) -> str:
+    """The ACTIVE Zeek log - exactly conn.log, never rotated copies."""
+    return os.path.join(ZEEK_LOG_DIR, basename)
+
+
+def load_conn_counter(client) -> Counter:
+    """Restore running (zone, service) totals after an ingest restart so
+    they keep growing instead of resetting. Only valid together with a
+    resumed state file (otherwise we would double count)."""
+    counter = Counter()
+    try:
+        for zone, service, count in client.query(
+                "SELECT zone, service, count FROM connection_stats").result_rows:
+            counter[(zone, service)] += int(count)
+        log.info(f"Restored {sum(counter.values())} connection count(s) from ClickHouse")
+    except Exception as e:
+        log.warning(f"Could not restore connection_stats ({e}); counting from zero")
+    return counter
 
 
 def parse_notice_line(line):
@@ -342,8 +466,8 @@ def push_assets(client, assets: dict, dirty: set):
 
 def main():
     client = connect_clickhouse()
-    tailer = FileTailer()
-    conn_counter = Counter()
+    tailer = LogFollower(STATE_FILE)
+    conn_counter = load_conn_counter(client) if tailer.loaded else Counter()
     assets, dirty_assets = {}, set()
     last_asset_push = 0.0
     log.info(f"Watching {ZEEK_LOG_DIR} for notice.log / software.log / conn.log")
@@ -352,19 +476,19 @@ def main():
         alert_records, software_records = [], []
         new_conn_lines = 0
 
-        for path in find_log_files("notice.log"):
+        for path in [log_path("notice.log")]:
             for line in tailer.read_new_lines(path):
                 row = parse_notice_line(line)
                 if row:
                     alert_records.append(row)
 
-        for path in find_log_files("software.log"):
+        for path in [log_path("software.log")]:
             for line in tailer.read_new_lines(path):
                 row = parse_software_line(line)
                 if row:
                     software_records.append(row)
 
-        for path in find_log_files("conn.log"):
+        for path in [log_path("conn.log")]:
             for line in tailer.read_new_lines(path):
                 count_conn_line(line, conn_counter, assets, dirty_assets)
                 new_conn_lines += 1
@@ -379,6 +503,7 @@ def main():
             push_assets(client, assets, dirty_assets)
             last_asset_push = time.time()
 
+        tailer.save()
         time.sleep(POLL_SECONDS)
 
 

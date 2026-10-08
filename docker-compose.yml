@@ -2,9 +2,7 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
     container_name: ids_clickhouse
-    ports:
-      - "8123:8123"
-      - "9000:9000"
+    restart: unless-stopped
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
@@ -13,28 +11,37 @@ services:
       - CLICKHOUSE_USER=siem_user
       - CLICKHOUSE_PASSWORD=changeme
 
+  # --- Zeek: LIVE capture from the NIC plugged into the switch's SPAN /
+  # mirror port. network_mode: host is what lets the container see the
+  # real network card. Set LIVE_IFACE in .env (see .env.example).
   zeek:
     build: ./zeek
     container_name: ids_zeek
+    restart: unless-stopped
+    network_mode: host
     cap_add:
       - NET_ADMIN
       - NET_RAW
     volumes:
       - ./zeek/local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
       - ./zeek/signatures:/usr/local/zeek/share/zeek/site/signatures:ro
-      - ./pcaps:/pcaps:ro
       - zeek_logs:/usr/local/zeek/logs
     environment:
-      - MODE=pcap
-      - PCAP_FILE=/pcaps/sample.pcap
+      - LIVE_IFACE=${LIVE_IFACE:-}
+      - ZEEK_BPF=${ZEEK_BPF:-}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-7}
+      - CLEAN_LOGS_ON_START=${CLEAN_LOGS_ON_START:-true}
 
   ingest:
     build: ./ingest
     container_name: ids_ingest
+    restart: unless-stopped
     volumes:
       - zeek_logs:/usr/local/zeek/logs:ro
+      - ingest_state:/state
     environment:
       - ZEEK_LOG_DIR=/usr/local/zeek/logs
+      - STATE_FILE=/state/ingest_state.json
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_PORT=8123
       - CLICKHOUSE_USER=siem_user
@@ -48,6 +55,7 @@ services:
   cve-matcher:
     build: ./cve
     container_name: ids_cve_matcher
+    restart: unless-stopped
     volumes:
       - ./cve/cve_data:/cve_data
     environment:
@@ -65,8 +73,7 @@ services:
   dashboard:
     build: ./dashboard
     container_name: ids_dashboard
-    ports:
-      - "8501:8501"
+    restart: unless-stopped
     environment:
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_PORT=8123
@@ -83,8 +90,6 @@ services:
     build: ./admin-console
     container_name: ids_admin_console
     restart: unless-stopped   # console has no ClickHouse retry loop; retry until DB is up
-    ports:
-      - "8000:8000"
     environment:
       - CLICKHOUSE_HOST=clickhouse
       - CLICKHOUSE_PORT=8123
@@ -93,18 +98,19 @@ services:
       - CLICKHOUSE_DB=siem
       - CLICKHOUSE_SECURE=false
       - ADMIN_USER=admin
-      - ADMIN_PASSWORD=changeme123
+      - ADMIN_PASSWORD=changeme@1234
       - AGENT_API_KEY=some-long-random-shared-secret-change-this
     depends_on:
       clickhouse:
         condition: service_started
 
   # --- Single front door: merges admin-console (at /) and the
-  # Streamlit dashboard (at /dashboard/) onto one site/port, per your
-  # "both should be on the same website" ask. The two services keep
-  # their own ports (8000, 8501) too, for direct local debugging -
-  # on the real testbed server, PROXY_PORT (default 8080) is the only
-  # port people need to be told about.
+  # Streamlit dashboard (at /dashboard/) onto one site/port.
+  # This is the ONLY published port (PROXY_PORT, default 8080).
+  # ClickHouse, the dashboard and the admin console are reachable
+  # only on the internal Docker network. For debugging use
+  # `docker exec` / `docker compose exec`, or temporarily add a
+  # "127.0.0.1:<port>:<port>" mapping to the service in question.
   proxy:
     image: nginx:1.27-alpine
     container_name: ids_proxy
@@ -119,4 +125,5 @@ services:
 
 volumes:
   zeek_logs:
+  ingest_state:
   clickhouse_data:
